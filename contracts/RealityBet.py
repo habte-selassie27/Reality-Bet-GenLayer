@@ -196,3 +196,48 @@ class RealityBet(gl.Contract):
         self.total_volume = u256(int(self.total_volume) + int(amount))
         self.markets[market_id] = m
         return bid
+
+    @gl.public.write
+    def claim_winnings(self, bet_id: str) -> u256:
+        b = self._get_bet(bet_id)
+        m = self._get_market(b.market_id)
+        if not b.bettor == gl.message.sender_address:
+            raise gl.vm.UserError("Not your bet")
+        if b.claimed:
+            raise gl.vm.UserError("Already claimed")
+        if not m.status == MarketStatus.RESOLVED:
+            raise gl.vm.UserError("Market not resolved")
+        payout = u256(0)
+        if m.outcome == Outcome.VOID:
+            payout = b.amount
+        elif b.side == m.outcome:
+            total_pool = u256(int(m.pool_yes) + int(m.pool_no))
+            win_pool = m.pool_yes if m.outcome == Outcome.YES else m.pool_no
+            if int(win_pool) == 0:
+                payout = u256(0)
+            else:
+                gross = u256(int(b.amount) * int(total_pool) // int(win_pool))
+                fee = u256(int(gross) * int(m.fee_bps) // 10000)
+                payout = u256(int(gross) - int(fee))
+                if int(fee) > 0:
+                    gl.get_contract_at(self.owner).emit_transfer(value=fee)
+        b.claimed = True
+        self.bets[bet_id] = b
+        if int(payout) > 0:
+            gl.get_contract_at(b.bettor).emit_transfer(value=payout)
+        return payout
+
+    @gl.public.write
+    def refund_void(self, bet_id: str) -> bool:
+        b = self._get_bet(bet_id)
+        m = self._get_market(b.market_id)
+        if not b.bettor == gl.message.sender_address:
+            raise gl.vm.UserError("Not your bet")
+        if b.claimed:
+            raise gl.vm.UserError("Already claimed")
+        if not m.status == MarketStatus.VOIDED:
+            raise gl.vm.UserError("Market not voided")
+        b.claimed = True
+        self.bets[bet_id] = b
+        gl.get_contract_at(b.bettor).emit_transfer(value=b.amount)
+        return True

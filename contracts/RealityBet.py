@@ -241,3 +241,45 @@ class RealityBet(gl.Contract):
         self.bets[bet_id] = b
         gl.get_contract_at(b.bettor).emit_transfer(value=b.amount)
         return True
+
+    @gl.public.write
+    def request_resolution(self, market_id: str) -> bool:
+        m = self._get_market(market_id)
+        if not self._now() >= m.resolve_time:
+            raise gl.vm.UserError("Too early to resolve")
+        if not m.status == MarketStatus.LOCKED:
+            raise gl.vm.UserError("Must be locked first")
+        self._resolve(market_id)
+        return True
+
+    def _resolve(self, market_id: str) -> None:
+        m = self._get_market(market_id)
+        title = m.title
+        desc = m.description
+        url = m.resolution_url
+        cat = m.category
+        prompt = (
+            "You are an impartial prediction market resolver with web access.\n"
+            'MARKET QUESTION: "' + title + '"\nDESCRIPTION: ' + desc + "\n"
+            "CRITERIA: YES if event clearly occurred. NO if clearly NOT occurred. "
+            "VOID only if ambiguous, source unavailable, or unanswerable.\n"
+            "PRIMARY SOURCE: " + url + "\nCATEGORY: " + cat + "\n"
+            "1.Fetch primary source.2.Search corroborating sources.3.Decide yes|no|void."
+            "4.Confidence high|medium|low.5.Reason max 2 sentences.\n"
+            'Respond ONLY JSON: {"outcome":"yes","confidence":"high",'
+            '"reason":"...","sources_checked":["url1"]}'
+        )
+
+        def _fetch() -> str:
+            web_data = gl.nondet.web.get(url)
+            body = web_data.body.decode("utf-8")[:6000]
+            full = prompt + "\nPAGE CONTENT:\n" + body
+            res = gl.nondet.exec_prompt(full)
+            if isinstance(res, dict):
+                return json.dumps(res, sort_keys=True)
+            cleaned = res.replace("```json", "").replace("```", "").strip()
+            return json.dumps(json.loads(cleaned), sort_keys=True)
+
+        raw = gl.eq_principle.prompt_comparative(
+            _fetch, "`outcome` must be exactly the same. All other fields must be similar"
+        )

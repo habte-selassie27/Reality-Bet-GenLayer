@@ -27,3 +27,46 @@ class Category:
     TECH = "tech"
     SCIENCE = "science"
     CUSTOM = "custom"
+
+
+@allow_storage
+@dataclass
+class Market:
+    id: str
+    creator: Address
+    title: str
+    description: str
+    resolution_url: str
+    category: str
+    close_time: u256
+    resolve_time: u256
+    outcome: str
+    status: str
+    pool_yes: u256
+    pool_no: u256
+    fee_bps: u256
+    resolved_at: u256
+    resolver_note: str
+
+
+@allow_storage
+@dataclass
+class Bet:
+    id: str
+    market_id: str
+    bettor: Address
+    side: str
+    amount: u256
+    claimed: bool
+    placed_at: u256
+
+
+@allow_storage
+@dataclass
+class Dispute:
+    id: str
+    market_id: str
+    raised_by: Address
+    reason: str
+    resolved: bool
+    outcome: str

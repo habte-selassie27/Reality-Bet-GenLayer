@@ -71,6 +71,12 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
       const id = String(out.result ?? "");
       addMarket(network, id);
       setCreated({ id, tx: out.hash });
+      setTitle("");
+      setDescription("");
+      setUrl("https://");
+      setCategory("crypto");
+      setClose(defaultClose());
+      setResolve(defaultResolve());
       onCreated(id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

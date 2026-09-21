@@ -26,7 +26,7 @@ function toLocal(d: Date): string {
 }
 
 export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => void }) {
-  const { network, address } = useWallet();
+  const { network, address, provider } = useWallet();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [url, setUrl] = useState("https://");
@@ -56,7 +56,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
     setBusy(true);
     setError(null);
     try {
-      const out = await createMarket(network, address, {
+      const out = await createMarket(network, address, provider, {
         title: title.trim(),
         description: description.trim(),
         resolution_url: url.trim(),

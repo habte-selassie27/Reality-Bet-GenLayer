@@ -180,64 +180,65 @@ export async function getPlatformStats(network: NetworkKey): Promise<PlatformSta
 
 function write<T>(
   network: NetworkKey,
-  account: any,
+  address: string,
+  provider: any,
   method: string,
   args: unknown[] = [],
   value = 0n,
 ): Promise<TxOutcome<T>> {
-  // account can be a viem Account object OR a string address
-  // The wallet context decides which path to use
-  return sendWrite<T>({ network, accountOrAddress: account, method, args, value });
+  return sendWrite<T>({ network, address, provider, method, args, value });
 }
 
 export const createMarket = (
   network: NetworkKey,
-  account: string,
+  address: string,
+  provider: any,
   p: { title: string; description: string; resolution_url: string; category: string; close_time: number; resolve_time: number },
-) => write<string>(network, account, "create_market", [p.title, p.description, p.resolution_url, p.category, p.close_time, p.resolve_time]);
+) => write<string>(network, address, provider, "create_market", [p.title, p.description, p.resolution_url, p.category, p.close_time, p.resolve_time]);
 
-export const lockMarket = (network: NetworkKey, account: string, marketId: string) =>
-  write<boolean>(network, account, "lock_market", [marketId]);
+export const lockMarket = (network: NetworkKey, address: string, provider: any, marketId: string) =>
+  write<boolean>(network, address, provider, "lock_market", [marketId]);
 
-export const voidMarket = (network: NetworkKey, account: string, marketId: string) =>
-  write<boolean>(network, account, "void_market", [marketId]);
+export const voidMarket = (network: NetworkKey, address: string, provider: any, marketId: string) =>
+  write<boolean>(network, address, provider, "void_market", [marketId]);
 
-export const fundMarket = (network: NetworkKey, account: string, marketId: string, valueWei: bigint) =>
-  write<boolean>(network, account, "fund_market", [marketId], valueWei);
+export const fundMarket = (network: NetworkKey, address: string, provider: any, marketId: string, valueWei: bigint) =>
+  write<boolean>(network, address, provider, "fund_market", [marketId], valueWei);
 
-export const placeBet = (network: NetworkKey, account: string, marketId: string, side: string, valueWei: bigint) =>
-  write<string>(network, account, "place_bet", [marketId, side], valueWei);
+export const placeBet = (network: NetworkKey, address: string, provider: any, marketId: string, side: string, valueWei: bigint) =>
+  write<string>(network, address, provider, "place_bet", [marketId, side], valueWei);
 
 /** Returns payout in wei (as decoded string/number). */
-export const claimWinnings = (network: NetworkKey, account: string, betId: string) =>
-  write<string | number>(network, account, "claim_winnings", [betId]);
+export const claimWinnings = (network: NetworkKey, address: string, provider: any, betId: string) =>
+  write<string | number>(network, address, provider, "claim_winnings", [betId]);
 
-export const refundVoid = (network: NetworkKey, account: string, betId: string) =>
-  write<boolean>(network, account, "refund_void", [betId]);
+export const refundVoid = (network: NetworkKey, address: string, provider: any, betId: string) =>
+  write<boolean>(network, address, provider, "refund_void", [betId]);
 
-export const requestResolution = (network: NetworkKey, account: string, marketId: string) =>
-  write<boolean>(network, account, "request_resolution", [marketId]);
+export const requestResolution = (network: NetworkKey, address: string, provider: any, marketId: string) =>
+  write<boolean>(network, address, provider, "request_resolution", [marketId]);
 
-export const forceResolve = (network: NetworkKey, account: string, marketId: string, outcome: string, note: string) =>
-  write<boolean>(network, account, "force_resolve", [marketId, outcome, note]);
+export const forceResolve = (network: NetworkKey, address: string, provider: any, marketId: string, outcome: string, note: string) =>
+  write<boolean>(network, address, provider, "force_resolve", [marketId, outcome, note]);
 
-export const raiseDispute = (network: NetworkKey, account: string, marketId: string, reason: string) =>
-  write<string>(network, account, "raise_dispute", [marketId, reason]);
+export const raiseDispute = (network: NetworkKey, address: string, provider: any, marketId: string, reason: string) =>
+  write<string>(network, address, provider, "raise_dispute", [marketId, reason]);
 
 export const resolveDispute = (
   network: NetworkKey,
-  account: string,
+  address: string,
+  provider: any,
   disputeId: string,
   upheld: boolean,
   newOutcome: string,
   note: string,
-) => write<boolean>(network, account, "resolve_dispute", [disputeId, upheld, newOutcome, note]);
+) => write<boolean>(network, address, provider, "resolve_dispute", [disputeId, upheld, newOutcome, note]);
 
-export const reResolve = (network: NetworkKey, account: string, marketId: string) =>
-  write<boolean>(network, account, "re_resolve", [marketId]);
+export const reResolve = (network: NetworkKey, address: string, provider: any, marketId: string) =>
+  write<boolean>(network, address, provider, "re_resolve", [marketId]);
 
-export const setFee = (network: NetworkKey, account: string, bps: number) =>
-  write<boolean>(network, account, "set_fee", [bps]);
+export const setFee = (network: NetworkKey, address: string, provider: any, bps: number) =>
+  write<boolean>(network, address, provider, "set_fee", [bps]);
 
-export const transferOwnership = (network: NetworkKey, account: string, newOwner: string) =>
-  write<boolean>(network, account, "transfer_ownership", [newOwner]);
+export const transferOwnership = (network: NetworkKey, address: string, provider: any, newOwner: string) =>
+  write<boolean>(network, address, provider, "transfer_ownership", [newOwner]);

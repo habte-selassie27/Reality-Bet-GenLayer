@@ -34,7 +34,7 @@ interface Detail {
 export function MarketDetail() {
   const { id = "" } = useParams();
   const marketId = decodeURIComponent(id);
-  const { network, address } = useWallet();
+  const { network, address, provider } = useWallet();
   const now = useNow(1000);
   const [betOpen, setBetOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -187,18 +187,18 @@ export function MarketDetail() {
                   <Btn className="w-full" onClick={() => setBetOpen(true)}>Place bet</Btn>
                 )}
                 {m.status === "open" && now >= m.close_time && (
-                  <Btn variant="ghost" className="w-full" disabled={busy !== null} onClick={() => address && run("Lock", () => lockMarket(network, address, m.id))}>
+                  <Btn variant="ghost" className="w-full" disabled={busy !== null} onClick={() => address && run("Lock", () => lockMarket(network, address, provider, m.id))}>
                     {busy === "Lock" ? "Locking…" : "Lock market"}
                   </Btn>
                 )}
                 {m.status === "locked" && now >= m.resolve_time && (
-                  <Btn className="w-full" disabled={busy !== null} onClick={() => address && run("AI resolve", () => requestResolution(network, address, m.id))}>
+                  <Btn className="w-full" disabled={busy !== null} onClick={() => address && run("AI resolve", () => requestResolution(network, address, provider, m.id))}>
                     {busy === "AI resolve" ? "AI resolving (minutes)…" : "Request AI resolution"}
                   </Btn>
                 )}
                 {(m.status === "open" || m.status === "locked") && address &&
                   (sameAddress(m.creator, address)) && (
-                  <Btn variant="danger" className="w-full" disabled={busy !== null} onClick={() => address && run("Void", () => voidMarket(network, address, m.id))}>
+                  <Btn variant="danger" className="w-full" disabled={busy !== null} onClick={() => address && run("Void", () => voidMarket(network, address, provider, m.id))}>
                     Void market
                   </Btn>
                 )}
@@ -227,7 +227,7 @@ export function MarketDetail() {
                         <Btn
                           className="mt-2 w-full"
                           disabled={busy !== null}
-                          onClick={() => address && run("Claim", () => claimWinnings(network, address, b.id))}
+                          onClick={() => address && run("Claim", () => claimWinnings(network, address, provider, b.id))}
                         >
                           Claim winnings
                         </Btn>
@@ -236,7 +236,7 @@ export function MarketDetail() {
                         <Btn
                           className="mt-2 w-full"
                           disabled={busy !== null}
-                          onClick={() => address && run("Refund", () => refundVoid(network, address, b.id))}
+                          onClick={() => address && run("Refund", () => refundVoid(network, address, provider, b.id))}
                         >
                           Refund (voided)
                         </Btn>
@@ -261,7 +261,7 @@ export function MarketDetail() {
                     variant="danger"
                     className="w-full"
                     disabled={busy !== null || !disputeReason.trim()}
-                    onClick={() => address && run("Dispute", () => raiseDispute(network, address, m.id, disputeReason.trim()))}
+                    onClick={() => address && run("Dispute", () => raiseDispute(network, address, provider, m.id, disputeReason.trim()))}
                   >
                     Submit dispute
                   </Btn>

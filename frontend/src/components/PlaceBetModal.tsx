@@ -39,7 +39,7 @@ export function PlaceBetModal({
     setBusy(true);
     setError(null);
     try {
-      const out = await placeBet(network, address, market.id, side, wei);
+      const out = await placeBet(network, address, provider, market.id, side, wei);
       if (!out.ok) {
         setError(out.revertReason ?? "Bet reverted");
         return;

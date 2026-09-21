@@ -17,24 +17,19 @@ export function getClient(network: NetworkKey): Client {
 }
 
 /**
- * Write-capable client. Pass address string + provider for MetaMask signing,
- * or a viem Account for local key signing.
+ * Write-capable client for MetaMask / EIP-1193 wallets.
+ * SDK routes eth_sendTransaction to the provider.
  */
 export function getWriteClient(
   network: NetworkKey,
-  accountOrAddress: string,
-  provider?: any,
+  address: string,
+  provider: any,
 ): Client {
-  const opts: any = { chain: NETWORKS[network].chain };
-  if (provider) {
-    // MetaMask path: SDK routes eth_sendTransaction to the provider
-    opts.account = accountOrAddress;
-    opts.provider = provider;
-  } else {
-    // Local key path: SDK signs locally with the Account object
-    opts.account = accountOrAddress;
-  }
-  return createClient(opts);
+  return createClient({
+    chain: NETWORKS[network].chain,
+    account: address as `0x${string}`,
+    provider,
+  });
 }
 
 export function contractAddress(): string {
@@ -104,25 +99,26 @@ function revertFromReadable(readable: string | null): string | null {
 
 /**
  * Send a write, wait for finalization, and classify the outcome.
- * accountOrAddress: either a viem Account object or a string address (for MetaMask).
- * provider: EIP-1193 provider (window.ethereum) — required when address is a string.
+ * address: checksummed wallet address (from MetaMask).
+ * provider: EIP-1193 provider (window.ethereum).
+ * Never throws on contract reverts — they come back as { ok: false }.
  */
 export async function sendWrite<T>(opts: {
   network: NetworkKey;
-  accountOrAddress: any;
-  provider?: any;
+  address: string;
+  provider: any;
   method: string;
   args?: unknown[];
   value?: bigint;
   waitMs?: number;
 }): Promise<TxOutcome<T>> {
-  const client = getWriteClient(opts.network, opts.accountOrAddress, opts.provider);
+  const client = getWriteClient(opts.network, opts.address, opts.provider);
+
   const hash = (await client.writeContract({
     address: contractAddress() as `0x${string}`,
     functionName: opts.method,
     args: (opts.args ?? []) as never[],
     value: opts.value ?? 0n,
-    account: opts.accountOrAddress,
   })) as unknown as string;
 
   const waitMs = opts.waitMs ?? 1000 * 60 * 8;

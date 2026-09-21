@@ -393,3 +393,76 @@ class RealityBet(gl.Contract):
         self.markets[market_id] = m
         self._resolve(market_id)
         return True
+
+    @gl.public.view
+    def get_market(self, market_id: str) -> dict:
+        m = self._get_market(market_id)
+        return {"id": m.id, "creator": format(m.creator, "x"), "title": m.title,
+                "description": m.description, "resolution_url": m.resolution_url,
+                "category": m.category, "close_time": int(m.close_time),
+                "resolve_time": int(m.resolve_time), "outcome": m.outcome,
+                "status": m.status, "pool_yes": int(m.pool_yes), "pool_no": int(m.pool_no),
+                "fee_bps": int(m.fee_bps), "resolved_at": int(m.resolved_at),
+                "resolver_note": m.resolver_note}
+
+    @gl.public.view
+    def get_bet(self, bet_id: str) -> dict:
+        b = self._get_bet(bet_id)
+        return {"id": b.id, "market_id": b.market_id, "bettor": format(b.bettor, "x"),
+                "side": b.side, "amount": int(b.amount), "claimed": b.claimed,
+                "placed_at": int(b.placed_at)}
+
+    @gl.public.view
+    def get_dispute(self, dispute_id: str) -> dict:
+        if dispute_id not in self.disputes:
+            raise gl.vm.UserError("Dispute not found")
+        d = self.disputes[dispute_id]
+        return {"id": d.id, "market_id": d.market_id, "raised_by": format(d.raised_by, "x"),
+                "reason": d.reason, "resolved": d.resolved, "outcome": d.outcome}
+
+    @gl.public.view
+    def get_market_bets(self, market_id: str) -> typing.Any:
+        if market_id not in self.market_bets:
+            return []
+        return list(self.market_bets[market_id])
+
+    @gl.public.view
+    def get_bettor_bets(self, bettor: str) -> typing.Any:
+        key = bettor.lower().replace("0x", "")
+        for k in self.bettor_bets:
+            if k.lower() == key:
+                return list(self.bettor_bets[k])
+        return []
+
+    @gl.public.view
+    def get_odds(self, market_id: str) -> dict:
+        m = self._get_market(market_id)
+        total = int(m.pool_yes) + int(m.pool_no)
+        if total == 0:
+            return {"yes": 50, "no": 50, "pool_yes": 0, "pool_no": 0, "total_pool": 0}
+        yes_pct = int(m.pool_yes) * 100 // total
+        return {"yes": yes_pct, "no": 100 - yes_pct, "pool_yes": int(m.pool_yes),
+                "pool_no": int(m.pool_no), "total_pool": total}
+
+    @gl.public.view
+    def get_market_stats(self, market_id: str) -> dict:
+        m = self._get_market(market_id)
+        bids: typing.Any = []
+        if market_id in self.market_bets:
+            bids = list(self.market_bets[market_id])
+        yc = 0
+        nc = 0
+        for bid in bids:
+            if self.bets[bid].side == Outcome.YES:
+                yc += 1
+            else:
+                nc += 1
+        return {"market_id": market_id, "title": m.title, "status": m.status,
+                "outcome": m.outcome, "pool_yes": int(m.pool_yes), "pool_no": int(m.pool_no),
+                "total_bets": len(bids), "yes_bets": yc, "no_bets": nc,
+                "resolver_note": m.resolver_note}
+
+    @gl.public.view
+    def get_platform_stats(self) -> dict:
+        return {"total_markets": int(self.market_count), "total_volume": int(self.total_volume),
+                "fee_bps": int(self.platform_fee_bps), "owner": format(self.owner, "x")}

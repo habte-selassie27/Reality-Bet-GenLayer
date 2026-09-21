@@ -70,3 +70,41 @@ class Dispute:
     reason: str
     resolved: bool
     outcome: str
+
+
+class RealityBet(gl.Contract):
+    markets: TreeMap[str, Market]
+    bets: TreeMap[str, Bet]
+    disputes: TreeMap[str, Dispute]
+    market_bets: TreeMap[str, DynArray[str]]
+    bettor_bets: TreeMap[str, DynArray[str]]
+    owner: Address
+    platform_fee_bps: u256
+    total_volume: u256
+    market_count: u256
+    bet_count: u256
+    dispute_count: u256
+
+    def __init__(self):
+        self.owner = gl.message.sender_address
+        self.platform_fee_bps = u256(150)
+        self.total_volume = u256(0)
+        self.market_count = u256(0)
+        self.bet_count = u256(0)
+        self.dispute_count = u256(0)
+
+    def _now(self) -> u256:
+        return u256(int(datetime.now(timezone.utc).timestamp()))
+
+    def _get_market(self, mid: str) -> Market:
+        if mid not in self.markets:
+            raise gl.vm.UserError("Market not found")
+        return self.markets[mid]
+
+    def _get_bet(self, bid: str) -> Bet:
+        if bid not in self.bets:
+            raise gl.vm.UserError("Bet not found")
+        return self.bets[bid]
+
+    def _addr_key(self, a: Address) -> str:
+        return format(a, "x")

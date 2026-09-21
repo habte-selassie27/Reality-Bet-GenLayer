@@ -466,3 +466,19 @@ class RealityBet(gl.Contract):
     def get_platform_stats(self) -> dict:
         return {"total_markets": int(self.market_count), "total_volume": int(self.total_volume),
                 "fee_bps": int(self.platform_fee_bps), "owner": format(self.owner, "x")}
+
+    @gl.public.write
+    def set_fee(self, bps: u256) -> bool:
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        if not bps <= u256(500):
+            raise gl.vm.UserError("Max 5 percent")
+        self.platform_fee_bps = bps
+        return True
+
+    @gl.public.write
+    def transfer_ownership(self, new_owner: Address) -> bool:
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        self.owner = new_owner
+        return True

@@ -138,3 +138,112 @@ def test_resolve_void_refunds(direct_vm, direct_deploy, direct_owner, direct_ali
     assert contract.get_market(mid)["outcome"] == "void"
     direct_vm.sender = direct_alice
     assert int(contract.claim_winnings(bid)) == 5000
+
+
+def test_low_confidence_voids(direct_vm, direct_deploy, direct_owner, direct_alice):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp("2025-01-01T01:00:00Z")
+    _mock_resolution(direct_vm, "yes", confidence="low")
+    contract.request_resolution(mid)
+    m = contract.get_market(mid)
+    assert m["outcome"] == "void"
+    assert "Low confidence" in m["resolver_note"]
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 1000
+
+
+def test_duplicate_claim_reverts(direct_vm, direct_deploy, direct_owner, direct_alice):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp("2025-01-01T01:00:00Z")
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    direct_vm.sender = direct_alice
+    contract.claim_winnings(bid)
+    with direct_vm.expect_revert("Already claimed"):
+        contract.claim_winnings(bid)
+
+
+def test_dispute_flow(direct_vm, direct_deploy, direct_owner, direct_alice):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp("2025-01-01T01:00:00Z")
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    direct_vm.sender = direct_alice
+    did = contract.raise_dispute(mid, "Primary source misread")
+    assert contract.get_market(mid)["status"] == "disputed"
+    direct_vm.sender = direct_owner
+    assert contract.resolve_dispute(did, True, "no", "Manual review: event did not occur") is True
+    m = contract.get_market(mid)
+    assert m["status"] == "resolved" and m["outcome"] == "no"
+    d = contract.get_dispute(did)
+    assert d["resolved"] is True and d["outcome"] == "upheld"
+
+
+def test_loser_gets_zero(direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_bob
+    direct_vm.value = 1000
+    bid_no = contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp("2025-01-01T01:00:00Z")
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    direct_vm.sender = direct_bob
+    assert int(contract.claim_winnings(bid_no)) == 0
+
+
+def test_fee_split(direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    assert contract.set_fee(200) is True
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 3000
+    bid_yes = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_bob
+    direct_vm.value = 1000
+    contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp("2025-01-01T01:00:00Z")
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    assert contract.get_market(mid)["fee_bps"] == 200
+    direct_vm.sender = direct_alice
+    payout = int(contract.claim_winnings(bid_yes))
+    # gross=(3000*4000)//3000=4000, fee=4000*200//10000=80, net=3920
+    assert payout == 3920

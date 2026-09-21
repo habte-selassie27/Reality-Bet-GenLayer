@@ -167,3 +167,32 @@ class RealityBet(gl.Contract):
         self.total_volume = u256(int(self.total_volume) + int(v))
         self.markets[market_id] = m
         return True
+
+    @gl.public.write.payable
+    def place_bet(self, market_id: str, side: str) -> str:
+        m = self._get_market(market_id)
+        if not m.status == MarketStatus.OPEN:
+            raise gl.vm.UserError("Market not open")
+        if not self._now() < m.close_time:
+            raise gl.vm.UserError("Betting closed")
+        s = side.lower().strip()
+        if s not in [Outcome.YES, Outcome.NO]:
+            raise gl.vm.UserError('Side must be yes or no')
+        amount = gl.message.value
+        if not amount > u256(0):
+            raise gl.vm.UserError("Must send GEN")
+        bettor = gl.message.sender_address
+        now = self._now()
+        bid = "b" + str(int(self.bet_count)) + "-" + str(int(now))
+        self.bet_count = u256(int(self.bet_count) + 1)
+        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now)
+        self.market_bets.get_or_insert_default(market_id).append(bid)
+        key = self._addr_key(bettor)
+        self.bettor_bets.get_or_insert_default(key).append(bid)
+        if s == Outcome.YES:
+            m.pool_yes = u256(int(m.pool_yes) + int(amount))
+        else:
+            m.pool_no = u256(int(m.pool_no) + int(amount))
+        self.total_volume = u256(int(self.total_volume) + int(amount))
+        self.markets[market_id] = m
+        return bid

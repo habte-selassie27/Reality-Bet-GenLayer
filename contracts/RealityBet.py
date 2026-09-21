@@ -129,3 +129,41 @@ class RealityBet(gl.Contract):
         )
         self.market_bets.get_or_insert_default(mid)
         return mid
+
+    @gl.public.write
+    def lock_market(self, market_id: str) -> bool:
+        m = self._get_market(market_id)
+        if not self._now() >= m.close_time:
+            raise gl.vm.UserError("Market not closed yet")
+        if not m.status == MarketStatus.OPEN:
+            raise gl.vm.UserError("Market not open")
+        m.status = MarketStatus.LOCKED
+        self.markets[market_id] = m
+        return True
+
+    @gl.public.write
+    def void_market(self, market_id: str) -> bool:
+        m = self._get_market(market_id)
+        sender = gl.message.sender_address
+        if not (sender == m.creator or sender == self.owner):
+            raise gl.vm.UserError("Not authorized")
+        if m.status not in [MarketStatus.OPEN, MarketStatus.LOCKED]:
+            raise gl.vm.UserError("Cannot void at this stage")
+        m.status = MarketStatus.VOIDED
+        self.markets[market_id] = m
+        return True
+
+    @gl.public.write.payable
+    def fund_market(self, market_id: str) -> bool:
+        m = self._get_market(market_id)
+        if not m.status == MarketStatus.OPEN:
+            raise gl.vm.UserError("Market not open")
+        v = gl.message.value
+        if not v > u256(0):
+            raise gl.vm.UserError("Must send GEN")
+        half = u256(int(v) // 2)
+        m.pool_yes = u256(int(m.pool_yes) + int(half))
+        m.pool_no = u256(int(m.pool_no) + int(v) - int(half))
+        self.total_volume = u256(int(self.total_volume) + int(v))
+        self.markets[market_id] = m
+        return True

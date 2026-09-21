@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { DEFAULT_NETWORK, type NetworkKey } from "./chains";
+import { DEFAULT_NETWORK, NETWORKS, type NetworkKey } from "./chains";
 import { getClient } from "./genlayer";
 
 const NET_KEY = "realitybet.network.v1";
@@ -21,9 +21,16 @@ interface Wallet {
   provider: any;
   connect: () => Promise<void>;
   disconnect: () => void;
+  /** Ensure MetaMask is on the correct GenLayer chain. */
+  ensureChain: () => Promise<void>;
 }
 
 const Ctx = createContext<Wallet | null>(null);
+
+/** Hex chain ID for MetaMask wallet_switchEthereumChain. */
+function chainIdHex(network: NetworkKey): string {
+  return "0x" + NETWORKS[network].chain.id.toString(16);
+}
 
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [network, setNetworkState] = useState<NetworkKey>(() => {
@@ -53,6 +60,31 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  /** Switch MetaMask to the GenLayer chain for the current network. */
+  const ensureChain = useCallback(async () => {
+    const eth = (window as any).ethereum;
+    if (!eth) return;
+    const targetId = chainIdHex(network);
+    try {
+      await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: targetId }] });
+    } catch (err: any) {
+      // Error code 4902 = chain not added yet — add it
+      if (err?.code === 4902) {
+        const cfg = NETWORKS[network];
+        await eth.request({
+          method: "wallet_addEthereumChain",
+          params: [{
+            chainId: targetId,
+            chainName: cfg.chain.name,
+            rpcUrls: [cfg.chain.rpcUrls.default.http[0]],
+          }],
+        });
+      } else {
+        throw err;
+      }
+    }
+  }, [network]);
+
   /** Connect to MetaMask / injected wallet. */
   const connect = useCallback(async () => {
     const eth = (window as any).ethereum;
@@ -65,13 +97,32 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         method: "eth_requestAccounts",
       });
       if (!accounts || accounts.length === 0) return;
+      // Switch to correct chain before proceeding
+      const targetId = chainIdHex(network);
+      try {
+        await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: targetId }] });
+      } catch (chainErr: any) {
+        if (chainErr?.code === 4902) {
+          const cfg = NETWORKS[network];
+          await eth.request({
+            method: "wallet_addEthereumChain",
+            params: [{
+              chainId: targetId,
+              chainName: cfg.chain.name,
+              rpcUrls: [cfg.chain.rpcUrls.default.http[0]],
+            }],
+          });
+        } else {
+          throw chainErr;
+        }
+      }
       setAddress(accounts[0]);
       setProvider(eth);
     } catch (err: any) {
       console.error("Wallet connection failed:", err);
       alert(err?.message ?? "Failed to connect wallet.");
     }
-  }, []);
+  }, [network]);
 
   const disconnect = useCallback(() => {
     setAddress(null);
@@ -155,8 +206,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       provider,
       connect,
       disconnect,
+      ensureChain,
     }),
-    [network, setNetwork, address, balanceWei, provider, connect, disconnect],
+    [network, setNetwork, address, balanceWei, provider, connect, disconnect, ensureChain],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

@@ -32,6 +32,28 @@ export function getWriteClient(
   });
 }
 
+/** Ensure MetaMask is on the correct GenLayer chain before sending a tx. */
+export async function ensureChain(eth: any, network: NetworkKey): Promise<void> {
+  const targetId = "0x" + NETWORKS[network].chain.id.toString(16);
+  try {
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: targetId }] });
+  } catch (err: any) {
+    if (err?.code === 4902) {
+      const cfg = NETWORKS[network];
+      await eth.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: targetId,
+          chainName: cfg.chain.name,
+          rpcUrls: [cfg.chain.rpcUrls.default.http[0]],
+        }],
+      });
+    } else {
+      throw err;
+    }
+  }
+}
+
 export function contractAddress(): string {
   return CONTRACT_ADDRESS;
 }
@@ -112,6 +134,9 @@ export async function sendWrite<T>(opts: {
   value?: bigint;
   waitMs?: number;
 }): Promise<TxOutcome<T>> {
+  // Ensure MetaMask is on the correct GenLayer chain before sending
+  await ensureChain(opts.provider, opts.network);
+
   const client = getWriteClient(opts.network, opts.address, opts.provider);
 
   const hash = (await client.writeContract({

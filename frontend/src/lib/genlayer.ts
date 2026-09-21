@@ -1,7 +1,9 @@
 import { createClient } from "genlayer-js";
 import { TransactionStatus } from "genlayer-js/types";
 import type { Hash } from "genlayer-js/types";
+import { encodeFunctionData, type Abi } from "viem";
 import { CONTRACT_ADDRESS, NETWORKS, type NetworkKey } from "./chains";
+import { REALITY_BET_ABI } from "./abi";
 
 type Client = ReturnType<typeof createClient>;
 
@@ -14,22 +16,6 @@ export function getClient(network: NetworkKey): Client {
   const c = createClient({ chain: NETWORKS[network].chain });
   clients.set(network, c);
   return c;
-}
-
-/**
- * Write-capable client for MetaMask / EIP-1193 wallets.
- * SDK routes eth_sendTransaction to the provider.
- */
-export function getWriteClient(
-  network: NetworkKey,
-  address: string,
-  provider: any,
-): Client {
-  return createClient({
-    chain: NETWORKS[network].chain,
-    account: address as `0x${string}`,
-    provider,
-  });
 }
 
 /** Ensure MetaMask is on the correct GenLayer chain before sending a tx. */
@@ -120,10 +106,9 @@ function revertFromReadable(readable: string | null): string | null {
 }
 
 /**
- * Send a write, wait for finalization, and classify the outcome.
- * address: checksummed wallet address (from MetaMask).
- * provider: EIP-1193 provider (window.ethereum).
- * Never throws on contract reverts — they come back as { ok: false }.
+ * Send a write transaction directly via MetaMask's eth_sendTransaction,
+ * bypassing the SDK's writeContract which has chainId mismatch issues.
+ * Then poll the GenLayer SDK for the finalized receipt.
  */
 export async function sendWrite<T>(opts: {
   network: NetworkKey;
@@ -134,18 +119,29 @@ export async function sendWrite<T>(opts: {
   value?: bigint;
   waitMs?: number;
 }): Promise<TxOutcome<T>> {
-  // Ensure MetaMask is on the correct GenLayer chain before sending
   await ensureChain(opts.provider, opts.network);
 
-  const client = getWriteClient(opts.network, opts.address, opts.provider);
-
-  const hash = (await client.writeContract({
-    address: contractAddress() as `0x${string}`,
+  const data = encodeFunctionData({
+    abi: REALITY_BET_ABI as Abi,
     functionName: opts.method,
     args: (opts.args ?? []) as never[],
-    value: opts.value ?? 0n,
-  })) as unknown as string;
+  });
 
+  const txParams: Record<string, unknown> = {
+    from: opts.address,
+    to: contractAddress(),
+    data,
+  };
+  if (opts.value && opts.value > 0n) {
+    txParams.value = "0x" + opts.value.toString(16);
+  }
+
+  const hash = (await opts.provider.request({
+    method: "eth_sendTransaction",
+    params: [txParams],
+  })) as string;
+
+  const client = getClient(opts.network);
   const waitMs = opts.waitMs ?? 1000 * 60 * 8;
   const retries = Math.max(1, Math.floor(waitMs / 5000));
   const receipt = await client.waitForTransactionReceipt({

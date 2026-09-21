@@ -108,3 +108,24 @@ class RealityBet(gl.Contract):
 
     def _addr_key(self, a: Address) -> str:
         return format(a, "x")
+
+    @gl.public.write
+    def create_market(
+        self, title: str, description: str, resolution_url: str, category: str, close_time: u256, resolve_time: u256
+    ) -> str:
+        now = self._now()
+        if not close_time > now:
+            raise gl.vm.UserError("Close time must be future")
+        if not resolve_time >= close_time:
+            raise gl.vm.UserError("Resolve after close")
+        if category not in [Category.SPORTS, Category.POLITICS, Category.CRYPTO, Category.TECH, Category.SCIENCE, Category.CUSTOM]:
+            raise gl.vm.UserError("Invalid category")
+        mid = "m" + str(int(self.market_count)) + "-" + str(int(now))
+        self.market_count = u256(int(self.market_count) + 1)
+        self.markets[mid] = Market(
+            mid, gl.message.sender_address, title, description, resolution_url,
+            category, close_time, resolve_time, "", MarketStatus.OPEN,
+            u256(0), u256(0), self.platform_fee_bps, u256(0), "",
+        )
+        self.market_bets.get_or_insert_default(mid)
+        return mid

@@ -1,7 +1,6 @@
 import { createClient } from "genlayer-js";
 import { TransactionStatus } from "genlayer-js/types";
 import type { Hash } from "genlayer-js/types";
-import type { Account } from "viem";
 import { CONTRACT_ADDRESS, NETWORKS, type NetworkKey } from "./chains";
 
 type Client = ReturnType<typeof createClient>;
@@ -17,9 +16,25 @@ export function getClient(network: NetworkKey): Client {
   return c;
 }
 
-/** Write-capable client bound to a signer account. */
-export function getWriteClient(network: NetworkKey, account: Account): Client {
-  return createClient({ chain: NETWORKS[network].chain, account });
+/**
+ * Write-capable client. Pass address string + provider for MetaMask signing,
+ * or a viem Account for local key signing.
+ */
+export function getWriteClient(
+  network: NetworkKey,
+  accountOrAddress: string,
+  provider?: any,
+): Client {
+  const opts: any = { chain: NETWORKS[network].chain };
+  if (provider) {
+    // MetaMask path: SDK routes eth_sendTransaction to the provider
+    opts.account = accountOrAddress;
+    opts.provider = provider;
+  } else {
+    // Local key path: SDK signs locally with the Account object
+    opts.account = accountOrAddress;
+  }
+  return createClient(opts);
 }
 
 export function contractAddress(): string {
@@ -87,36 +102,27 @@ function revertFromReadable(readable: string | null): string | null {
   return typeof parsed === "string" && parsed.length > 0 ? parsed : readable;
 }
 
-export interface TxOutcome<T> {
-  hash: string;
-  ok: boolean;
-  /** Decoded return payload (bet id, bool, payout wei-string, …). */
-  result: T | null;
-  /** Raw leader execution result, e.g. SUCCESS / ERROR. */
-  execution: string;
-  /** Revert reason when ok === false. */
-  revertReason: string | null;
-}
-
 /**
  * Send a write, wait for finalization, and classify the outcome.
- * Never throws on contract reverts — they come back as { ok: false }.
+ * accountOrAddress: either a viem Account object or a string address (for MetaMask).
+ * provider: EIP-1193 provider (window.ethereum) — required when address is a string.
  */
 export async function sendWrite<T>(opts: {
   network: NetworkKey;
-  account: Account;
+  accountOrAddress: any;
+  provider?: any;
   method: string;
   args?: unknown[];
   value?: bigint;
   waitMs?: number;
 }): Promise<TxOutcome<T>> {
-  const client = getWriteClient(opts.network, opts.account);
+  const client = getWriteClient(opts.network, opts.accountOrAddress, opts.provider);
   const hash = (await client.writeContract({
     address: contractAddress() as `0x${string}`,
     functionName: opts.method,
     args: (opts.args ?? []) as never[],
     value: opts.value ?? 0n,
-    account: opts.account,
+    account: opts.accountOrAddress,
   })) as unknown as string;
 
   const waitMs = opts.waitMs ?? 1000 * 60 * 8;

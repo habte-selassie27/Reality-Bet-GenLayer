@@ -15,7 +15,7 @@ import { isOwnerAddress, useOwner } from "../lib/owner";
 import { useWallet } from "../lib/wallet";
 
 export function Admin() {
-  const { network, account, address } = useWallet();
+  const { network, address } = useWallet();
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; text: string; hash?: string } | null>(null);
 
@@ -59,7 +59,7 @@ export function Admin() {
   }
 
   async function run(label: string, fn: () => Promise<{ ok: boolean; hash: string; revertReason: string | null; result: unknown }>) {
-    if (!account) {
+    if (!address) {
       setMsg({ ok: false, text: "Connect the owner wallet first." });
       return;
     }
@@ -107,7 +107,7 @@ export function Admin() {
           <h3 className="font-semibold text-white">Platform fee (bps)</h3>
           <div className="mt-2 flex gap-2">
             <input value={feeBps} onChange={(e) => setFeeBps(e.target.value)} inputMode="numeric" className={inputCls} />
-            <Btn disabled={!isOwner || busy !== null} onClick={() => account && run("Set fee", () => setFee(network, account, Number(feeBps)))}>
+            <Btn disabled={!isOwner || busy !== null} onClick={() => address && run("Set fee", () => setFee(network, address, Number(feeBps)))}>
               {busy === "Set fee" ? "…" : "Set"}
             </Btn>
           </div>
@@ -126,7 +126,7 @@ export function Admin() {
                 <option value="void">void</option>
               </select>
               <input value={frNote} onChange={(e) => setFrNote(e.target.value)} placeholder="Note" className={inputCls} />
-              <Btn disabled={!isOwner || busy !== null || !frMarket.trim()} onClick={() => account && run("Force resolve", () => forceResolve(network, account, frMarket.trim(), frOutcome, frNote))}>
+              <Btn disabled={!isOwner || busy !== null || !frMarket.trim()} onClick={() => address && run("Force resolve", () => forceResolve(network, address, frMarket.trim(), frOutcome, frNote))}>
                 {busy === "Force resolve" ? "…" : "Go"}
               </Btn>
             </div>
@@ -150,7 +150,7 @@ export function Admin() {
               <input value={rdNote} onChange={(e) => setRdNote(e.target.value)} placeholder="Note" className={inputCls} />
               <Btn
                 disabled={!isOwner || busy !== null || !rdId.trim()}
-                onClick={() => account && run("Resolve dispute", () => resolveDispute(network, account, rdId.trim(), rdUpheld, rdOutcome, rdNote))}
+                onClick={() => address && run("Resolve dispute", () => resolveDispute(network, address, rdId.trim(), rdUpheld, rdOutcome, rdNote))}
               >
                 {busy === "Resolve dispute" ? "…" : "Go"}
               </Btn>
@@ -180,7 +180,7 @@ export function Admin() {
           <p className="mt-1 text-xs text-zinc-500">For DISPUTED markets — validators re-fetch and re-vote.</p>
           <div className="mt-2 flex gap-2">
             <input value={rrMarket} onChange={(e) => setRrMarket(e.target.value)} placeholder="Market id" className={`${inputCls} font-mono`} />
-            <Btn disabled={!isOwner || busy !== null || !rrMarket.trim()} onClick={() => account && run("Re-resolve", () => reResolve(network, account, rrMarket.trim()))}>
+            <Btn disabled={!isOwner || busy !== null || !rrMarket.trim()} onClick={() => address && run("Re-resolve", () => reResolve(network, address, rrMarket.trim()))}>
               {busy === "Re-resolve" ? "AI working…" : "Go"}
             </Btn>
           </div>
@@ -195,8 +195,8 @@ export function Admin() {
               variant="danger"
               disabled={!isOwner || busy !== null || !/^0x[0-9a-fA-F]{40}$/.test(toAddr.trim())}
               onClick={() => {
-                if (account && window.confirm(`Transfer ownership to ${toAddr.trim()}?`)) {
-                  run("Transfer", () => transferOwnership(network, account, toAddr.trim()));
+                if (address && window.confirm(`Transfer ownership to ${toAddr.trim()}?`)) {
+                  run("Transfer", () => transferOwnership(network, address, toAddr.trim()));
                 }
               }}
             >

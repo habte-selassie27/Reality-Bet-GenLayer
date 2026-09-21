@@ -34,7 +34,7 @@ interface Detail {
 export function MarketDetail() {
   const { id = "" } = useParams();
   const marketId = decodeURIComponent(id);
-  const { network, account, address } = useWallet();
+  const { network, address } = useWallet();
   const now = useNow(1000);
   const [betOpen, setBetOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -63,7 +63,7 @@ export function MarketDetail() {
   }, [network, marketId]);
 
   async function run(label: string, fn: () => Promise<{ ok: boolean; hash: string; revertReason: string | null; result: unknown }>) {
-    if (!account) {
+    if (!address) {
       setActionErr("Connect a wallet first.");
       return;
     }
@@ -187,18 +187,18 @@ export function MarketDetail() {
                   <Btn className="w-full" onClick={() => setBetOpen(true)}>Place bet</Btn>
                 )}
                 {m.status === "open" && now >= m.close_time && (
-                  <Btn variant="ghost" className="w-full" disabled={busy !== null} onClick={() => account && run("Lock", () => lockMarket(network, account, m.id))}>
+                  <Btn variant="ghost" className="w-full" disabled={busy !== null} onClick={() => address && run("Lock", () => lockMarket(network, address, m.id))}>
                     {busy === "Lock" ? "Locking…" : "Lock market"}
                   </Btn>
                 )}
                 {m.status === "locked" && now >= m.resolve_time && (
-                  <Btn className="w-full" disabled={busy !== null} onClick={() => account && run("AI resolve", () => requestResolution(network, account, m.id))}>
+                  <Btn className="w-full" disabled={busy !== null} onClick={() => address && run("AI resolve", () => requestResolution(network, address, m.id))}>
                     {busy === "AI resolve" ? "AI resolving (minutes)…" : "Request AI resolution"}
                   </Btn>
                 )}
                 {(m.status === "open" || m.status === "locked") && address &&
                   (sameAddress(m.creator, address)) && (
-                  <Btn variant="danger" className="w-full" disabled={busy !== null} onClick={() => account && run("Void", () => voidMarket(network, account, m.id))}>
+                  <Btn variant="danger" className="w-full" disabled={busy !== null} onClick={() => address && run("Void", () => voidMarket(network, address, m.id))}>
                     Void market
                   </Btn>
                 )}
@@ -210,7 +210,7 @@ export function MarketDetail() {
                   {txMsg.extra && <div className="mt-1 font-mono">→ {txMsg.extra}</div>}
                 </div>
               )}
-              {!account && <div className="mt-2 text-xs text-amber-300">Connect a wallet to act.</div>}
+              {!address && <div className="mt-2 text-xs text-amber-300">Connect a wallet to act.</div>}
             </Card>
 
             {myBets.length > 0 && (
@@ -227,7 +227,7 @@ export function MarketDetail() {
                         <Btn
                           className="mt-2 w-full"
                           disabled={busy !== null}
-                          onClick={() => account && run("Claim", () => claimWinnings(network, account, b.id))}
+                          onClick={() => address && run("Claim", () => claimWinnings(network, address, b.id))}
                         >
                           Claim winnings
                         </Btn>
@@ -236,7 +236,7 @@ export function MarketDetail() {
                         <Btn
                           className="mt-2 w-full"
                           disabled={busy !== null}
-                          onClick={() => account && run("Refund", () => refundVoid(network, account, b.id))}
+                          onClick={() => address && run("Refund", () => refundVoid(network, address, b.id))}
                         >
                           Refund (voided)
                         </Btn>
@@ -261,7 +261,7 @@ export function MarketDetail() {
                     variant="danger"
                     className="w-full"
                     disabled={busy !== null || !disputeReason.trim()}
-                    onClick={() => account && run("Dispute", () => raiseDispute(network, account, m.id, disputeReason.trim()))}
+                    onClick={() => address && run("Dispute", () => raiseDispute(network, address, m.id, disputeReason.trim()))}
                   >
                     Submit dispute
                   </Btn>

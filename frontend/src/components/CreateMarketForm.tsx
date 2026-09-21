@@ -26,7 +26,7 @@ function toLocal(d: Date): string {
 }
 
 export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => void }) {
-  const { network, account } = useWallet();
+  const { network, address } = useWallet();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [url, setUrl] = useState("https://");
@@ -39,7 +39,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (!account) {
+    if (!address) {
       setError("Connect a wallet first.");
       return;
     }
@@ -56,7 +56,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
     setBusy(true);
     setError(null);
     try {
-      const out = await createMarket(network, account, {
+      const out = await createMarket(network, address, {
         title: title.trim(),
         description: description.trim(),
         resolution_url: url.trim(),
@@ -119,10 +119,10 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
           Market created: <span className="font-mono">{created.id}</span> · tx <TxHash hash={created.tx} />
         </div>
       )}
-      <Btn type="submit" disabled={!account || busy || !title.trim()}>
+      <Btn type="submit" disabled={!address || busy || !title.trim()}>
         {busy ? "Waiting for consensus…" : "Create market"}
       </Btn>
-      {!account && <div className="text-xs text-amber-300">Connect a wallet to create markets.</div>}
+      {!address && <div className="text-xs text-amber-300">Connect a wallet to create markets.</div>}
     </form>
   );
 }

@@ -13,7 +13,7 @@ export function PlaceBetModal({
   onClose: () => void;
   onPlaced: (betId: string, txHash: string) => void;
 }) {
-  const { network, account } = useWallet();
+  const { network, address, provider } = useWallet();
   const [side, setSide] = useState<"yes" | "no">("yes");
   const [amount, setAmount] = useState("0.5");
   const [busy, setBusy] = useState(false);
@@ -35,11 +35,11 @@ export function PlaceBetModal({
   }, [wei, side, market]);
 
   async function submit() {
-    if (!account || wei === null) return;
+    if (!address || !provider || wei === null) return;
     setBusy(true);
     setError(null);
     try {
-      const out = await placeBet(network, account, market.id, side, wei);
+      const out = await placeBet(network, address, market.id, side, wei);
       if (!out.ok) {
         setError(out.revertReason ?? "Bet reverted");
         return;
@@ -107,14 +107,14 @@ export function PlaceBetModal({
         )}
 
         <div className="mt-4 flex gap-2">
-          <Btn className="flex-1" disabled={!account || wei === null || busy} onClick={submit}>
+          <Btn className="flex-1" disabled={!address || wei === null || busy} onClick={submit}>
             {busy ? "Waiting for consensus…" : `Bet ${side.toUpperCase()}`}
           </Btn>
           <Btn variant="ghost" onClick={onClose}>
             Close
           </Btn>
         </div>
-        {!account && <div className="mt-2 text-xs text-amber-300">Connect a wallet to place bets.</div>}
+        {!address && <div className="mt-2 text-xs text-amber-300">Connect a wallet to place bets.</div>}
       </div>
     </div>
   );

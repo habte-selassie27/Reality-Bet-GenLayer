@@ -1,5 +1,3 @@
-import { createAccount, generatePrivateKey } from "genlayer-js";
-import type { Account } from "viem";
 import {
   createContext,
   useCallback,
@@ -12,24 +10,16 @@ import {
 import { DEFAULT_NETWORK, type NetworkKey } from "./chains";
 import { getClient } from "./genlayer";
 
-const PK_KEY = "realitybet.pk.v1";
 const NET_KEY = "realitybet.network.v1";
-
-function normalizeKey(input: string): `0x${string}` | null {
-  const s = input.trim().toLowerCase();
-  const hex = s.startsWith("0x") ? s : `0x${s}`;
-  if (/^0x[0-9a-f]{64}$/.test(hex)) return hex as `0x${string}`;
-  return null;
-}
 
 interface Wallet {
   network: NetworkKey;
   setNetwork: (n: NetworkKey) => void;
-  account: Account | null;
   address: string | null;
   balanceWei: bigint | null;
-  importKey: (raw: string) => boolean;
-  newBurner: () => string;
+  /** EIP-1193 provider (window.ethereum) for MetaMask signing. */
+  provider: any;
+  connect: () => Promise<void>;
   disconnect: () => void;
 }
 
@@ -50,27 +40,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
     return DEFAULT_NETWORK;
   });
-  const [pk, setPk] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem(PK_KEY);
-    } catch {
-      return null;
-    }
-  });
+  const [address, setAddress] = useState<string | null>(null);
+  const [provider, setProvider] = useState<any>(null);
   const [balanceWei, setBalanceWei] = useState<bigint | null>(null);
-
-  const account = useMemo<Account | null>(() => {
-    if (!pk) return null;
-    const norm = normalizeKey(pk);
-    if (!norm) return null;
-    try {
-      return createAccount(norm);
-    } catch {
-      return null;
-    }
-  }, [pk]);
-
-  const address = account?.address ?? null;
 
   const setNetwork = useCallback((n: NetworkKey) => {
     setNetworkState(n);
@@ -81,37 +53,70 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const importKey = useCallback((raw: string) => {
-    const norm = normalizeKey(raw);
-    if (!norm) return false;
-    try {
-      localStorage.setItem(PK_KEY, norm);
-    } catch {
-      /* empty */
+  /** Connect to MetaMask / injected wallet. */
+  const connect = useCallback(async () => {
+    const eth = (window as any).ethereum;
+    if (!eth) {
+      alert("Please install MetaMask or another EVM wallet.");
+      return;
     }
-    setPk(norm);
-    return true;
-  }, []);
-
-  const newBurner = useCallback(() => {
-    const key = generatePrivateKey();
     try {
-      localStorage.setItem(PK_KEY, key);
-    } catch {
-      /* empty */
+      const accounts: string[] = await eth.request({
+        method: "eth_requestAccounts",
+      });
+      if (!accounts || accounts.length === 0) return;
+      setAddress(accounts[0]);
+      setProvider(eth);
+    } catch (err: any) {
+      console.error("Wallet connection failed:", err);
+      alert(err?.message ?? "Failed to connect wallet.");
     }
-    setPk(key);
-    return key;
   }, []);
 
   const disconnect = useCallback(() => {
-    try {
-      localStorage.removeItem(PK_KEY);
-    } catch {
-      /* empty */
-    }
-    setPk(null);
+    setAddress(null);
+    setProvider(null);
     setBalanceWei(null);
+  }, []);
+
+  // Auto-reconnect if previously connected.
+  useEffect(() => {
+    const eth = (window as any).ethereum;
+    if (!eth) return;
+    eth
+      .request({ method: "eth_accounts" })
+      .then((accounts: string[]) => {
+        if (accounts && accounts.length > 0) {
+          setAddress(accounts[0]);
+          setProvider(eth);
+        }
+      })
+      .catch(() => {
+        /* empty */
+      });
+  }, []);
+
+  // Listen for account / chain changes.
+  useEffect(() => {
+    const eth = (window as any).ethereum;
+    if (!eth) return;
+    const onAccounts = (accs: string[]) => {
+      if (accs.length === 0) {
+        setAddress(null);
+        setProvider(null);
+        setBalanceWei(null);
+      } else {
+        setAddress(accs[0]);
+        setProvider(eth);
+      }
+    };
+    const onChain = () => window.location.reload();
+    eth.on("accountsChanged", onAccounts);
+    eth.on("chainChanged", onChain);
+    return () => {
+      eth.removeListener("accountsChanged", onAccounts);
+      eth.removeListener("chainChanged", onChain);
+    };
   }, []);
 
   // Refresh native balance.
@@ -145,14 +150,13 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     () => ({
       network,
       setNetwork,
-      account,
       address,
       balanceWei,
-      importKey,
-      newBurner,
+      provider,
+      connect,
       disconnect,
     }),
-    [network, setNetwork, account, address, balanceWei, importKey, newBurner, disconnect],
+    [network, setNetwork, address, balanceWei, provider, connect, disconnect],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

@@ -18,7 +18,7 @@ interface Row extends Bet {
  * enumerates known markets instead (market_bets → get_bet → filter).
  */
 export function MyBets() {
-  const { network, account, address } = useWallet();
+  const { network, address } = useWallet();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
@@ -59,11 +59,11 @@ export function MyBets() {
   }, [network, address]);
 
   async function act(betId: string, kind: "claim" | "refund") {
-    if (!account) return;
+    if (!address) return;
     setBusyId(betId);
     setMsg(null);
     try {
-      const out = kind === "claim" ? await claimWinnings(network, account, betId) : await refundVoid(network, account, betId);
+      const out = kind === "claim" ? await claimWinnings(network, address, betId) : await refundVoid(network, address, betId);
       if (!out.ok) {
         setMsg(out.revertReason ?? "Transaction reverted");
       } else {

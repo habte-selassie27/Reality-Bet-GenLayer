@@ -283,3 +283,33 @@ class RealityBet(gl.Contract):
         raw = gl.eq_principle.prompt_comparative(
             _fetch, "`outcome` must be exactly the same. All other fields must be similar"
         )
+        outcome = "void"
+        reason = ""
+        try:
+            result = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(result, dict):
+                low = {}
+                for k, v in result.items():
+                    low[str(k).lower().strip()] = v
+                outcome = str(low.get("outcome", low.get("result", low.get("verdict", "void")))).lower().strip()
+                conf = str(low.get("confidence", low.get("conf", "low"))).lower().strip()
+                reason = str(low.get("reason", low.get("explanation", low.get("analysis", ""))))[:500]
+                if conf == "low" and outcome != "void":
+                    outcome = "void"
+                    reason = "Low confidence auto-void. Original: " + reason
+                if outcome not in [Outcome.YES, Outcome.NO, Outcome.VOID]:
+                    outcome = "void"
+                    reason = "Invalid AI outcome voided"
+            else:
+                outcome = "void"
+                reason = "AI parse error voided"
+        except Exception:
+            m.status = MarketStatus.VOIDED
+            m.resolver_note = "AI parse error voided"
+            self.markets[market_id] = m
+            return
+        m.outcome = outcome
+        m.status = MarketStatus.RESOLVED
+        m.resolved_at = self._now()
+        m.resolver_note = reason
+        self.markets[market_id] = m

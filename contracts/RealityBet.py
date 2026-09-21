@@ -313,3 +313,83 @@ class RealityBet(gl.Contract):
         m.resolved_at = self._now()
         m.resolver_note = reason
         self.markets[market_id] = m
+
+    @gl.public.write
+    def force_resolve(self, market_id: str, outcome: str, note: str) -> bool:
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        m = self._get_market(market_id)
+        if m.status not in [MarketStatus.LOCKED, MarketStatus.DISPUTED]:
+            raise gl.vm.UserError("Invalid state")
+        o = outcome.lower().strip()
+        if o not in [Outcome.YES, Outcome.NO, Outcome.VOID]:
+            raise gl.vm.UserError("Invalid outcome")
+        m.outcome = o
+        m.status = MarketStatus.RESOLVED
+        m.resolved_at = self._now()
+        m.resolver_note = "[FORCED] " + note
+        self.markets[market_id] = m
+        return True
+
+    @gl.public.write
+    def raise_dispute(self, market_id: str, reason: str) -> str:
+        m = self._get_market(market_id)
+        if not m.status == MarketStatus.RESOLVED:
+            raise gl.vm.UserError("Can only dispute resolved")
+        if not self._now() <= u256(int(m.resolved_at) + 86400):
+            raise gl.vm.UserError("Dispute window is 24h")
+        sender = gl.message.sender_address
+        found = False
+        if market_id in self.market_bets:
+            for bid in self.market_bets[market_id]:
+                if self.bets[bid].bettor == sender:
+                    found = True
+                    break
+        if not found:
+            raise gl.vm.UserError("Only bettors can dispute")
+        did = "d" + str(int(self.dispute_count)) + "-" + str(int(self._now()))
+        self.dispute_count = u256(int(self.dispute_count) + 1)
+        self.disputes[did] = Dispute(did, market_id, sender, reason, False, "")
+        m.status = MarketStatus.DISPUTED
+        self.markets[market_id] = m
+        return did
+
+    @gl.public.write
+    def resolve_dispute(self, dispute_id: str, upheld: bool, new_outcome: str, note: str) -> bool:
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        if dispute_id not in self.disputes:
+            raise gl.vm.UserError("Dispute not found")
+        d = self.disputes[dispute_id]
+        if d.resolved:
+            raise gl.vm.UserError("Already resolved")
+        m = self._get_market(d.market_id)
+        if upheld:
+            o = new_outcome.lower().strip()
+            if o not in [Outcome.YES, Outcome.NO, Outcome.VOID]:
+                raise gl.vm.UserError("Invalid outcome")
+            m.outcome = o
+            m.status = MarketStatus.RESOLVED
+            m.resolver_note = "[DISPUTE UPHELD] " + note
+            m.resolved_at = self._now()
+            d.outcome = "upheld"
+        else:
+            m.status = MarketStatus.RESOLVED
+            m.resolver_note = "[DISPUTE REJECTED] " + note
+            d.outcome = "rejected"
+        d.resolved = True
+        self.markets[d.market_id] = m
+        self.disputes[dispute_id] = d
+        return True
+
+    @gl.public.write
+    def re_resolve(self, market_id: str) -> bool:
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        m = self._get_market(market_id)
+        if not m.status == MarketStatus.DISPUTED:
+            raise gl.vm.UserError("Market not disputed")
+        m.status = MarketStatus.LOCKED
+        self.markets[market_id] = m
+        self._resolve(market_id)
+        return True

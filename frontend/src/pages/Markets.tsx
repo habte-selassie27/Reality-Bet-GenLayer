@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { MarketCard } from "../components/MarketCard";
-import { Btn, EmptyState, ErrorBox, Field, inputCls, PageHeader, Spinner } from "../components/ui";
+import { EmptyState, ErrorBox, inputCls, PageHeader, Spinner } from "../components/ui";
 import { getMarket, type Market } from "../lib/contract";
 import { useLoader } from "../lib/hooks";
-import { addMarket, listMarkets, removeMarket } from "../lib/market-registry";
+import { addMarket, listMarkets } from "../lib/market-registry";
 import { useWallet } from "../lib/wallet";
 
 export function Markets() {
@@ -12,6 +12,7 @@ export function Markets() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [query, setQuery] = useState("");
   const [importId, setImportId] = useState("");
+  const [showImport, setShowImport] = useState(false);
   const [ids, setIds] = useState<string[]>(() => listMarkets(network));
 
   const markets = useLoader(async () => {
@@ -36,54 +37,71 @@ export function Markets() {
     <div>
       <PageHeader
         title="Markets"
-        sub="Tracked markets on this network. The contract has no on-chain list, so the app keeps a local registry."
+        sub="Browse and search prediction markets"
         action={<Link to="/create" className="rounded-xl bg-violet-600 px-4 py-2 text-sm font-semibold text-white hover:bg-violet-500">+ New market</Link>}
       />
 
-      <div className="mb-5 flex flex-wrap gap-2">
-        <input value={importId} onChange={(e) => setImportId(e.target.value)} placeholder="Import market by id (m0-…)" className={`${inputCls} max-w-xs font-mono`} />
-        <Btn
-          variant="ghost"
-          onClick={() => {
-            if (importId.trim()) {
-              addMarket(network, importId.trim());
-              setImportId("");
-              refreshIds();
-            }
-          }}
-        >
-          Import
-        </Btn>
+      <div className="mb-5 flex flex-wrap items-center gap-2">
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-200 outline-none">
           {["all", "open", "locked", "resolved", "disputed", "voided"].map((s) => (
-            <option key={s} value={s}>{s}</option>
+            <option key={s} value={s}>{s === "all" ? "All statuses" : s}</option>
           ))}
         </select>
-        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search…" className={`${inputCls} max-w-xs`} />
+        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search markets…" className={`${inputCls} max-w-xs`} />
+        <button
+          onClick={() => setShowImport(!showImport)}
+          className="ml-auto text-xs text-zinc-500 underline hover:text-zinc-300"
+        >
+          {showImport ? "Hide import" : "Import by ID"}
+        </button>
       </div>
+
+      {showImport && (
+        <div className="mb-5 flex gap-2">
+          <input
+            value={importId}
+            onChange={(e) => setImportId(e.target.value)}
+            placeholder="Enter market ID (e.g. m0-1234567890)"
+            className={`${inputCls} max-w-xs font-mono`}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && importId.trim()) {
+                addMarket(network, importId.trim());
+                setImportId("");
+                refreshIds();
+              }
+            }}
+          />
+          <button
+            onClick={() => {
+              if (importId.trim()) {
+                addMarket(network, importId.trim());
+                setImportId("");
+                refreshIds();
+              }
+            }}
+            className="rounded-xl border border-white/10 px-4 py-2 text-sm text-zinc-300 hover:bg-white/5"
+          >
+            Import
+          </button>
+        </div>
+      )}
 
       {markets.loading ? (
         <Spinner label="Loading markets…" />
       ) : markets.error ? (
         <ErrorBox message={markets.error} onRetry={markets.reload} />
       ) : visible.length === 0 ? (
-        <EmptyState title="No markets match" hint="Adjust the filter or import a market id." />
+        <EmptyState
+          title="No markets found"
+          hint={ids.length === 0 ? "Create a market or import one by ID to get started." : "Try a different filter or search term."}
+        />
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
           {visible.map((m) =>
             (m as Market & { _missing?: boolean })._missing ? (
-              <div key={m.id} className="rounded-2xl border border-red-500/20 bg-red-500/5 p-5">
-                <div className="font-mono text-sm text-red-200">{m.id}</div>
-                <div className="mt-1 text-xs text-zinc-400">Not found on this network.</div>
-                <button
-                  onClick={() => {
-                    removeMarket(network, m.id);
-                    refreshIds();
-                  }}
-                  className="mt-3 text-xs text-zinc-400 underline hover:text-zinc-200"
-                >
-                  Remove from registry
-                </button>
+              <div key={m.id} className="rounded-2xl border border-white/5 bg-white/[0.02] p-5">
+                <div className="font-mono text-sm text-zinc-400">{m.id}</div>
+                <div className="mt-1 text-xs text-zinc-500">Market not found on this network.</div>
               </div>
             ) : (
               <MarketCard key={m.id} market={m as Market} />
@@ -91,11 +109,6 @@ export function Markets() {
           )}
         </div>
       )}
-      <div className="mt-6">
-        <Field label="Registry (this browser, this network)">
-          <div className="font-mono text-xs break-all text-zinc-500">{ids.join(", ") || "empty"}</div>
-        </Field>
-      </div>
     </div>
   );
 }

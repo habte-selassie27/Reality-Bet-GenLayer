@@ -5,6 +5,7 @@ import { getMarket, getPlatformStats } from "../lib/contract";
 import { fmtGen } from "../lib/format";
 import { useLoader } from "../lib/hooks";
 import { listMarkets } from "../lib/market-registry";
+import { NETWORKS } from "../lib/chains";
 import { useWallet } from "../lib/wallet";
 
 export function Home() {
@@ -51,18 +52,19 @@ export function Home() {
         ) : (
           <>
             <Card>
-              <div className="text-xs uppercase tracking-wide text-zinc-500">Markets</div>
-              <div className="mt-1 text-2xl font-bold text-white">{stats.data?.total_markets ?? 0}</div>
-            </Card>
-            <Card>
               <div className="text-xs uppercase tracking-wide text-zinc-500">Total volume</div>
               <div className="mt-1 text-2xl font-bold text-white">{fmtGen(stats.data?.total_volume ?? 0n)}</div>
+              <div className="mt-0.5 text-[11px] text-zinc-500">GEN wagered across all markets</div>
             </Card>
             <Card>
-              <div className="text-xs uppercase tracking-wide text-zinc-500">Platform fee</div>
-              <div className="mt-1 text-2xl font-bold text-white">
-                {((stats.data?.fee_bps ?? 0) / 100).toFixed(2)}%
-              </div>
+              <div className="text-xs uppercase tracking-wide text-zinc-500">Total bets</div>
+              <div className="mt-1 text-2xl font-bold text-white">{stats.data?.total_markets ?? 0}</div>
+              <div className="mt-0.5 text-[11px] text-zinc-500">Markets created on {NETWORKS[network].label}</div>
+            </Card>
+            <Card>
+              <div className="text-xs uppercase tracking-wide text-zinc-500">Network</div>
+              <div className="mt-1 text-2xl font-bold text-white">{NETWORKS[network].label}</div>
+              <div className="mt-0.5 text-[11px] text-zinc-500">Chain ID {NETWORKS[network].chain.id}</div>
             </Card>
           </>
         )}

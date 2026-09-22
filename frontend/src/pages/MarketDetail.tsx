@@ -7,7 +7,6 @@ import { Btn, Card, ErrorBox, Field, inputCls, PageHeader, Spinner, TxHash } fro
 import {
   claimWinnings,
   getBet,
-  getDispute,
   getMarket,
   getMarketBets,
   getOdds,
@@ -17,7 +16,6 @@ import {
   requestResolution,
   voidMarket,
   type Bet,
-  type Dispute,
   type Market,
   type Odds,
 } from "../lib/contract";
@@ -41,9 +39,6 @@ export function MarketDetail() {
   const [txMsg, setTxMsg] = useState<{ label: string; hash: string; extra?: string } | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [disputeReason, setDisputeReason] = useState("");
-  const [lookupId, setLookupId] = useState("");
-  const [lookup, setLookup] = useState<Dispute | null>(null);
-  const [lookupErr, setLookupErr] = useState<string | null>(null);
 
   const detail = useLoader<Detail>(async () => {
     const [market, odds, betIds] = await Promise.all([
@@ -144,36 +139,6 @@ export function MarketDetail() {
                       {address && sameAddress(b.bettor, address) && <span className="text-violet-300">you</span>}
                     </div>
                   ))}
-                </div>
-              )}
-            </Card>
-
-            <Card>
-              <h3 className="font-semibold text-white">Dispute lookup</h3>
-              <div className="mt-2 flex gap-2">
-                <input value={lookupId} onChange={(e) => setLookupId(e.target.value)} placeholder="Dispute id (d0-…)" className={`${inputCls} font-mono`} />
-                <Btn
-                  variant="ghost"
-                  onClick={async () => {
-                    setLookupErr(null);
-                    setLookup(null);
-                    try {
-                      setLookup(await getDispute(network, lookupId.trim()));
-                    } catch (e) {
-                      setLookupErr(e instanceof Error ? e.message : String(e));
-                    }
-                  }}
-                >
-                  Look up
-                </Btn>
-              </div>
-              {lookupErr && <div className="mt-2 text-xs text-red-300">{lookupErr}</div>}
-              {lookup && (
-                <div className="mt-2 rounded-xl bg-white/5 p-3 font-mono text-xs text-zinc-300">
-                  <div>market: {lookup.market_id}</div>
-                  <div>by: {shorten(lookup.raised_by)}</div>
-                  <div>reason: {lookup.reason}</div>
-                  <div>resolved: {String(lookup.resolved)} · outcome: {lookup.outcome || "—"}</div>
                 </div>
               )}
             </Card>

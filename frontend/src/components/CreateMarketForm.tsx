@@ -35,7 +35,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
   const { network, address, provider } = useWallet();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [url, setUrl] = useState("https://");
+  const [url, setUrl] = useState("");
   const [categories, setCategories] = useState<string[]>(["crypto"]);
   const [close, setClose] = useState(defaultClose);
   const [resolve, setResolve] = useState(defaultResolve);
@@ -83,7 +83,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
       setCreated({ id, tx: out.hash });
       setTitle("");
       setDescription("");
-      setUrl("https://");
+      setUrl("");
       setCategories(["crypto"]);
       setClose(defaultClose());
       setResolve(defaultResolve());
@@ -105,7 +105,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
       </Field>
       <div className="grid gap-4 sm:grid-cols-2">
         <Field label="Primary source URL (AI checks this)">
-          <input value={url} onChange={(e) => setUrl(e.target.value)} required type="url" className={`${inputCls} font-mono`} />
+          <input value={url} onChange={(e) => setUrl(e.target.value)} required type="url" placeholder="https://example.com/article" className={`${inputCls} font-mono`} />
         </Field>
         <Field label={`Categories (${categories.length}/${MAX_CATEGORIES})`}>
           <div className="flex flex-wrap gap-1.5">

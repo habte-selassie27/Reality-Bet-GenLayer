@@ -143,6 +143,8 @@ export const REALITY_BET_ABI = [
           { name: "fee_bps", type: "uint256" },
           { name: "resolved_at", type: "uint256" },
           { name: "resolver_note", type: "string" },
+          { name: "resolver_confidence", type: "string" },
+          { name: "resolver_sources", type: "string" },
         ],
       },
     ],

@@ -18,6 +18,8 @@ export interface Market {
   fee_bps: number;
   resolved_at: number;
   resolver_note: string;
+  resolver_confidence: string;
+  resolver_sources: string;
 }
 
 export interface Bet {
@@ -94,6 +96,8 @@ function normMarket(m: Record<string, unknown>): Market {
     fee_bps: toNumber(m["fee_bps"]),
     resolved_at: toNumber(m["resolved_at"]),
     resolver_note: toStr(m["resolver_note"]),
+    resolver_confidence: toStr(m["resolver_confidence"]),
+    resolver_sources: toStr(m["resolver_sources"]),
   };
 }
 

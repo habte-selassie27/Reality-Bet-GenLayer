@@ -190,10 +190,35 @@ export function MarketDetail() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
                     </svg>
                     AI Resolution
+                    {m.resolver_confidence && (
+                      <span
+                        className={`ml-auto rounded-full px-2 py-0.5 font-mono text-[10px] normal-case ${
+                          m.resolver_confidence === "high"
+                            ? "bg-emerald-500/15 text-emerald-300"
+                            : m.resolver_confidence === "medium"
+                              ? "bg-amber-500/15 text-amber-300"
+                              : "bg-rose-500/15 text-rose-300"
+                        }`}
+                      >
+                        confidence: {m.resolver_confidence}
+                      </span>
+                    )}
                   </div>
                   <p className="mt-2 text-sm leading-relaxed text-zinc-300">{m.resolver_note}</p>
                   <div className="mt-2 flex flex-wrap gap-3 text-[11px] text-zinc-500">
                     <span>Source checked: <a href={m.resolution_url} target="_blank" rel="noreferrer" className="text-violet-400 hover:underline">{m.resolution_url}</a></span>
+                    {(() => {
+                      try {
+                        const sources: unknown = m.resolver_sources ? JSON.parse(m.resolver_sources) : [];
+                        return Array.isArray(sources)
+                          ? sources.filter((s) => typeof s === "string" && s !== m.resolution_url).map((s) => (
+                              <span key={s}>· <a href={s} target="_blank" rel="noreferrer" className="text-violet-400 hover:underline">{s}</a></span>
+                            ))
+                          : null;
+                      } catch {
+                        return null;
+                      }
+                    })()}
                   </div>
                 </div>
               )}

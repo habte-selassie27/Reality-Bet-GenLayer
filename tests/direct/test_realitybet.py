@@ -42,6 +42,7 @@ def test_create_market(direct_vm, direct_deploy, direct_owner):
     assert m["status"] == "open"
     assert m["outcome"] == ""
     assert m["pool_yes"] == 0 and m["pool_no"] == 0
+    assert m["resolver_confidence"] == "" and m["resolver_sources"] == ""
 
 
 def test_place_bet_yes_no(direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob):
@@ -92,7 +93,10 @@ def test_resolve_yes_pays_winner(direct_vm, direct_deploy, direct_owner, direct_
     direct_vm.warp("2025-01-01T01:00:00Z")
     _mock_resolution(direct_vm, "yes")
     assert contract.request_resolution(mid) is True
-    assert contract.get_market(mid)["outcome"] == "yes"
+    m = contract.get_market(mid)
+    assert m["outcome"] == "yes"
+    assert m["resolver_confidence"] == "high"
+    assert "coinmarketcap.com" in m["resolver_sources"]
     direct_vm.sender = direct_alice
     payout = int(contract.claim_winnings(bid_yes))
     # gross=(6000*10000)//6000=10000, fee=10000*150//10000=150, net=9850
@@ -156,6 +160,7 @@ def test_low_confidence_voids(direct_vm, direct_deploy, direct_owner, direct_ali
     m = contract.get_market(mid)
     assert m["outcome"] == "void"
     assert "Low confidence" in m["resolver_note"]
+    assert m["resolver_confidence"] == "low"
     direct_vm.sender = direct_alice
     assert int(contract.claim_winnings(bid)) == 1000
 

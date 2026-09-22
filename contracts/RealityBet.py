@@ -47,6 +47,8 @@ class Market:
     fee_bps: u256
     resolved_at: u256
     resolver_note: str
+    resolver_confidence: str
+    resolver_sources: str
 
 
 @allow_storage
@@ -125,7 +127,7 @@ class RealityBet(gl.Contract):
         self.markets[mid] = Market(
             mid, gl.message.sender_address, title, description, resolution_url,
             category, close_time, resolve_time, "", MarketStatus.OPEN,
-            u256(0), u256(0), self.platform_fee_bps, u256(0), "",
+            u256(0), u256(0), self.platform_fee_bps, u256(0), "", "", "",
         )
         self.market_bets.get_or_insert_default(mid)
         return mid
@@ -285,6 +287,8 @@ class RealityBet(gl.Contract):
         )
         outcome = "void"
         reason = ""
+        conf = "low"
+        sources = ""
         try:
             result = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(result, dict):
@@ -294,6 +298,11 @@ class RealityBet(gl.Contract):
                 outcome = str(low.get("outcome", low.get("result", low.get("verdict", "void")))).lower().strip()
                 conf = str(low.get("confidence", low.get("conf", "low"))).lower().strip()
                 reason = str(low.get("reason", low.get("explanation", low.get("analysis", ""))))[:500]
+                srcs = low.get("sources_checked", low.get("sources", []))
+                if isinstance(srcs, list):
+                    sources = json.dumps([str(s) for s in srcs])
+                elif isinstance(srcs, str):
+                    sources = srcs
                 if conf == "low" and outcome != "void":
                     outcome = "void"
                     reason = "Low confidence auto-void. Original: " + reason
@@ -306,12 +315,15 @@ class RealityBet(gl.Contract):
         except Exception:
             m.status = MarketStatus.VOIDED
             m.resolver_note = "AI parse error voided"
+            m.resolver_confidence = "low"
             self.markets[market_id] = m
             return
         m.outcome = outcome
         m.status = MarketStatus.RESOLVED
         m.resolved_at = self._now()
         m.resolver_note = reason
+        m.resolver_confidence = conf
+        m.resolver_sources = sources
         self.markets[market_id] = m
 
     @gl.public.write
@@ -403,7 +415,9 @@ class RealityBet(gl.Contract):
                 "resolve_time": int(m.resolve_time), "outcome": m.outcome,
                 "status": m.status, "pool_yes": int(m.pool_yes), "pool_no": int(m.pool_no),
                 "fee_bps": int(m.fee_bps), "resolved_at": int(m.resolved_at),
-                "resolver_note": m.resolver_note}
+                "resolver_note": m.resolver_note,
+                "resolver_confidence": m.resolver_confidence,
+                "resolver_sources": m.resolver_sources}
 
     @gl.public.view
     def get_bet(self, bet_id: str) -> dict:

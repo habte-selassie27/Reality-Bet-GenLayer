@@ -4,7 +4,7 @@ Decentralized prediction market where GenLayer validator consensus settles real-
 
 ## How GenLayer consensus is used
 
-Resolution runs inside `gl.eq_principle.prompt_comparative`: the leader fetches `resolution_url` via `gl.nondet.web.get`, prompts the LLM for `{outcome, confidence, reason, sources_checked}`, and validators independently re-fetch + re-run the LLM. The `EqComparative` template accepts only if `outcome` matches exactly. No `strict_eq` on LLM text, no schema-only checks. Low confidence or unparsable output auto-voids to protect bettors.
+Resolution runs inside `gl.eq_principle.prompt_comparative`: the leader fetches `resolution_url` via `gl.nondet.web.get`, prompts the LLM for `{outcome, confidence, reason, sources_checked}`, and validators independently re-fetch + re-run the LLM. The `EqComparative` template accepts only if `outcome` matches exactly. No `strict_eq` on LLM text, no schema-only checks. Low confidence or unparsable output auto-voids to protect bettors. Stored resolution metadata: `resolver_confidence` (high/medium/low) and `resolver_sources` (JSON array) surface in `get_market` for frontend display.
 
 ## Payout formula (u256 only)
 

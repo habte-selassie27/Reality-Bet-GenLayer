@@ -85,8 +85,13 @@ export function readErrorMessage(err: unknown): string {
   const m = msg.match(/payload['"]?\s*:\s*['"]([^'"]+)['"]/);
   if (m) return m[1];
   if (/execution failed/i.test(msg)) return "Contract call reverted (see details)";
-  if (/fetch failed|timeout|network/i.test(msg)) return "Network error — Studio may be rate-limiting, retry shortly";
+  if (isNetworkError(msg)) return "Network error — Studio may be rate-limiting, retry shortly";
   return msg.slice(0, 180);
+}
+
+/** Detect transient network-level errors (RPC down, rate-limited, CORS). */
+function isNetworkError(msg: string): boolean {
+  return /fetch failed|timeout|network|ERR_CONNECTION_CLOSED|net::ERR|Failed to fetch|Connection closed/i.test(msg);
 }
 
 export interface TxOutcome<T> {
@@ -180,7 +185,13 @@ interface ReceiptClient {
  * used to do) reverts, because the EVM tx never enters consensus. The wallet is
  * switched to the right chain first, so the `chainId` the SDK attaches is the
  * one the wallet is already on.
+ *
+ * Retries transient network errors (RPC connection closed, rate-limited) up to
+ * 3 times with exponential backoff before giving up.
  */
+const MAX_WRITE_RETRIES = 3;
+const RETRY_BASE_MS = 2000;
+
 export async function sendWrite<T>(opts: {
   network: NetworkKey;
   address: string;
@@ -192,6 +203,38 @@ export async function sendWrite<T>(opts: {
 }): Promise<TxOutcome<T>> {
   await ensureChain(opts.provider, opts.network);
 
+  let lastErr: unknown;
+
+  for (let attempt = 1; attempt <= MAX_WRITE_RETRIES; attempt++) {
+    try {
+      return await sendWriteOnce<T>(opts);
+    } catch (err: unknown) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isNet = isNetworkError(msg);
+      // Only retry on transient network errors; contract reverts and user
+      // rejections (code 4001) should fail immediately.
+      const isUserReject = /4001|user rejected|denied/i.test(msg);
+      if (!isNet || isUserReject) throw err;
+      if (attempt < MAX_WRITE_RETRIES) {
+        const delay = RETRY_BASE_MS * Math.pow(2, attempt - 1);
+        console.warn(`[RealityBet] Network error (attempt ${attempt}/${MAX_WRITE_RETRIES}), retrying in ${delay}ms …`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+async function sendWriteOnce<T>(opts: {
+  network: NetworkKey;
+  address: string;
+  provider: any;
+  method: string;
+  args?: unknown[];
+  value?: bigint;
+  waitMs?: number;
+}): Promise<TxOutcome<T>> {
   const client = createClient({
     chain: NETWORKS[opts.network].chain,
     account: opts.address as `0x${string}`,

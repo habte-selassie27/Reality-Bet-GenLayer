@@ -5,6 +5,7 @@ import { WalletProvider } from "./lib/wallet";
 import { Admin } from "./pages/Admin";
 import { Create } from "./pages/Create";
 import { Home } from "./pages/Home";
+import { Leaderboard } from "./pages/Leaderboard";
 import { MarketDetail } from "./pages/MarketDetail";
 import { Markets } from "./pages/Markets";
 import { MyBets } from "./pages/MyBets";
@@ -23,6 +24,7 @@ export default function App() {
               <Route path="/markets/:id" element={<MarketDetail />} />
               <Route path="/create" element={<Create />} />
               <Route path="/my-bets" element={<MyBets />} />
+              <Route path="/leaderboard" element={<Leaderboard />} />
               <Route path="/admin" element={<Admin />} />
             </Routes>
           </main>

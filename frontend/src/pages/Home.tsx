@@ -44,27 +44,22 @@ export function Home() {
         </div>
       </div>
 
-      <div className="mt-6 grid gap-4 sm:grid-cols-3">
+      <div className="mt-6 grid gap-4 sm:grid-cols-2">
         {stats.loading ? (
           <Card><Spinner label="Loading stats…" /></Card>
         ) : stats.error ? (
-          <div className="sm:col-span-3"><ErrorBox message={stats.error} onRetry={stats.reload} /></div>
+          <div className="sm:col-span-2"><ErrorBox message={stats.error} onRetry={stats.reload} /></div>
         ) : (
           <>
             <Card>
               <div className="text-xs uppercase tracking-wide text-zinc-500">Total volume</div>
               <div className="mt-1 text-2xl font-bold text-white">{fmtGen(stats.data?.total_volume ?? 0n)}</div>
-              <div className="mt-0.5 text-[11px] text-zinc-500">GEN wagered across all markets</div>
+              <div className="mt-0.5 text-[11px] text-zinc-500">GEN wagered across all markets on {NETWORKS[network].label}</div>
             </Card>
             <Card>
-              <div className="text-xs uppercase tracking-wide text-zinc-500">Markets created</div>
-              <div className="mt-1 text-2xl font-bold text-white">{stats.data?.total_markets ?? 0}</div>
-              <div className="mt-0.5 text-[11px] text-zinc-500">All-time on {NETWORKS[network].label}</div>
-            </Card>
-            <Card>
-              <div className="text-xs uppercase tracking-wide text-zinc-500">Network</div>
-              <div className="mt-1 text-2xl font-bold text-white">{NETWORKS[network].label}</div>
-              <div className="mt-0.5 text-[11px] text-zinc-500">Chain ID {NETWORKS[network].chain.id}</div>
+              <div className="text-xs uppercase tracking-wide text-zinc-500">Platform fee</div>
+              <div className="mt-1 text-2xl font-bold text-white">{((stats.data?.fee_bps ?? 0) / 100).toFixed(2)}%</div>
+              <div className="mt-0.5 text-[11px] text-zinc-500">Deducted from winning payouts</div>
             </Card>
           </>
         )}

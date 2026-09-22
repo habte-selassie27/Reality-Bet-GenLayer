@@ -1,6 +1,8 @@
 import { SEED_MARKETS, type NetworkKey } from "./chains";
 
-const KEY = "realitybet.markets.v1";
+/** Bump this to force-clear stale localStorage data from old deployments. */
+const STORAGE_VERSION = 2;
+const KEY = `realitybet.markets.v${STORAGE_VERSION}`;
 
 /** Known test/probe markets to exclude from the registry. */
 const EXCLUDED = new Set(["m2-1789988760", "m3-1789988982", "m5-1789989445", "m7-1789990765"]);

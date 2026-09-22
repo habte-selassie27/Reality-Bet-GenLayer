@@ -1,4 +1,5 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { ChainBanner } from "./components/ChainBanner";
 import { Header } from "./components/Header";
 import { WalletProvider } from "./lib/wallet";
 import { Admin } from "./pages/Admin";
@@ -15,6 +16,7 @@ export default function App() {
         <div className="min-h-screen">
           <Header />
           <main className="mx-auto max-w-6xl px-4 py-6">
+            <ChainBanner />
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/markets" element={<Markets />} />

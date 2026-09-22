@@ -18,25 +18,54 @@ export function getClient(network: NetworkKey): Client {
   return c;
 }
 
-/** Ensure MetaMask is on the correct GenLayer chain before sending a tx. */
+/** Hex chain id as MetaMask expects it (lowercase, 0x-prefixed). */
+export function chainIdHex(network: NetworkKey): string {
+  return "0x" + NETWORKS[network].chain.id.toString(16);
+}
+
+/**
+ * Ensure the wallet is on the correct GenLayer chain before sending a tx.
+ *
+ * A tx sent while the wallet sits on another chain is rejected by MetaMask with
+ * `-32602 chainId should be same as current chainId`, so we verify with
+ * `eth_chainId` instead of trusting `wallet_switchEthereumChain` to have worked.
+ */
 export async function ensureChain(eth: any, network: NetworkKey): Promise<void> {
-  const targetId = "0x" + NETWORKS[network].chain.id.toString(16);
+  const cfg = NETWORKS[network];
+  const targetId = chainIdHex(network);
+
+  const already = await eth.request({ method: "eth_chainId" }).catch(() => null);
+  if (typeof already === "string" && already.toLowerCase() === targetId.toLowerCase()) return;
+
   try {
     await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: targetId }] });
   } catch (err: any) {
-    if (err?.code === 4902) {
-      const cfg = NETWORKS[network];
+    // 4902 = chain unknown to the wallet → register it, then it is selected.
+    if (err?.code === 4902 || err?.code === -32603) {
       await eth.request({
         method: "wallet_addEthereumChain",
         params: [{
           chainId: targetId,
           chainName: cfg.chain.name,
           rpcUrls: [cfg.chain.rpcUrls.default.http[0]],
+          // Required by EIP-3085 — a wallet may refuse to add the chain without it.
+          nativeCurrency: cfg.chain.nativeCurrency,
+          blockExplorerUrls: cfg.explorer ? [cfg.explorer] : [],
         }],
       });
+    } else if (err?.code === 4001) {
+      throw new Error(`Switch your wallet to ${cfg.chain.name} to continue.`);
     } else {
       throw err;
     }
+  }
+
+  const now = await eth.request({ method: "eth_chainId" }).catch(() => null);
+  if (typeof now === "string" && now.toLowerCase() !== targetId.toLowerCase()) {
+    throw new Error(
+      `Wallet is on chain ${parseInt(now, 16)} but RealityBet needs ${cfg.chain.name} ` +
+        `(${cfg.chain.id}). Switch networks in your wallet and retry.`,
+    );
   }
 }
 

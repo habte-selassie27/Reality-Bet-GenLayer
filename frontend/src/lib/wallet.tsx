@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { DEFAULT_NETWORK, NETWORKS, type NetworkKey } from "./chains";
-import { getClient } from "./genlayer";
+import { ensureChain as ensureWalletChain, getClient } from "./genlayer";
 
 const NET_KEY = "realitybet.network.v1";
 
@@ -19,17 +19,32 @@ interface Wallet {
   balanceWei: bigint | null;
   /** EIP-1193 provider (window.ethereum) for MetaMask signing. */
   provider: any;
+  /** Chain id currently selected in the wallet, or null while unknown. */
+  chainId: number | null;
+  /** Chain id the selected app network expects the wallet to be on. */
+  expectedChainId: number;
+  /** True when a wallet is connected but sitting on the wrong chain. */
+  wrongChain: boolean;
   connect: () => Promise<void>;
   disconnect: () => void;
   /** Ensure MetaMask is on the correct GenLayer chain. */
   ensureChain: () => Promise<void>;
+  /** Ask the wallet to switch to the expected chain. Throws if declined. */
+  switchChain: () => Promise<void>;
 }
 
 const Ctx = createContext<Wallet | null>(null);
 
-/** Hex chain ID for MetaMask wallet_switchEthereumChain. */
-function chainIdHex(network: NetworkKey): string {
-  return "0x" + NETWORKS[network].chain.id.toString(16);
+/** Read the wallet's active chain id (hex string) and normalise it to a number. */
+async function readChainId(eth: any): Promise<number | null> {
+  try {
+    const hex = await eth.request({ method: "eth_chainId" });
+    if (typeof hex !== "string") return null;
+    const id = parseInt(hex, 16);
+    return Number.isNaN(id) ? null : id;
+  } catch {
+    return null;
+  }
 }
 
 export function WalletProvider({ children }: { children: ReactNode }) {
@@ -50,6 +65,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string | null>(null);
   const [provider, setProvider] = useState<any>(null);
   const [balanceWei, setBalanceWei] = useState<bigint | null>(null);
+  const [chainId, setChainId] = useState<number | null>(null);
+
+  const expectedChainId = NETWORKS[network].chain.id;
 
   const setNetwork = useCallback((n: NetworkKey) => {
     setNetworkState(n);
@@ -58,31 +76,34 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     } catch {
       /* empty */
     }
+    // Keep the wallet on the same chain as the selected network, otherwise
+    // writes are rejected with a chainId mismatch. Failures are non-fatal:
+    // the wrong-chain banner offers a retry.
+    const eth = (window as any).ethereum;
+    if (eth) {
+      void ensureWalletChain(eth, n)
+        .then(() => readChainId(eth))
+        .then((id) => setChainId(id))
+        .catch(() => {
+          /* surface via banner */
+        });
+    }
   }, []);
 
-  /** Switch MetaMask to the GenLayer chain for the current network. */
+  /** Switch the wallet to the GenLayer chain for the current network. */
   const ensureChain = useCallback(async () => {
     const eth = (window as any).ethereum;
     if (!eth) return;
-    const targetId = chainIdHex(network);
-    try {
-      await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: targetId }] });
-    } catch (err: any) {
-      // Error code 4902 = chain not added yet — add it
-      if (err?.code === 4902) {
-        const cfg = NETWORKS[network];
-        await eth.request({
-          method: "wallet_addEthereumChain",
-          params: [{
-            chainId: targetId,
-            chainName: cfg.chain.name,
-            rpcUrls: [cfg.chain.rpcUrls.default.http[0]],
-          }],
-        });
-      } else {
-        throw err;
-      }
-    }
+    await ensureWalletChain(eth, network);
+    setChainId(await readChainId(eth));
+  }, [network]);
+
+  /** Switch the wallet to the correct chain, rejecting when the user declines. */
+  const switchChain = useCallback(async () => {
+    const eth = (window as any).ethereum;
+    if (!eth) throw new Error("No EVM wallet detected.");
+    await ensureWalletChain(eth, network);
+    setChainId(await readChainId(eth));
   }, [network]);
 
   /** Connect to MetaMask / injected wallet. */
@@ -97,27 +118,17 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         method: "eth_requestAccounts",
       });
       if (!accounts || accounts.length === 0) return;
-      // Switch to correct chain before proceeding
-      const targetId = chainIdHex(network);
-      try {
-        await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: targetId }] });
-      } catch (chainErr: any) {
-        if (chainErr?.code === 4902) {
-          const cfg = NETWORKS[network];
-          await eth.request({
-            method: "wallet_addEthereumChain",
-            params: [{
-              chainId: targetId,
-              chainName: cfg.chain.name,
-              rpcUrls: [cfg.chain.rpcUrls.default.http[0]],
-            }],
-          });
-        } else {
-          throw chainErr;
-        }
-      }
       setAddress(accounts[0]);
       setProvider(eth);
+      setChainId(await readChainId(eth));
+      // Best-effort switch; if the user declines, the banner prompts them so
+      // the wallet stays usable for reads instead of failing silently.
+      try {
+        await ensureWalletChain(eth, network);
+        setChainId(await readChainId(eth));
+      } catch (chainErr) {
+        console.warn("Chain switch skipped:", chainErr);
+      }
     } catch (err: any) {
       console.error("Wallet connection failed:", err);
       alert(err?.message ?? "Failed to connect wallet.");
@@ -128,6 +139,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setAddress(null);
     setProvider(null);
     setBalanceWei(null);
+    setChainId(null);
   }, []);
 
   // Auto-reconnect if previously connected.
@@ -136,10 +148,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (!eth) return;
     eth
       .request({ method: "eth_accounts" })
-      .then((accounts: string[]) => {
+      .then(async (accounts: string[]) => {
         if (accounts && accounts.length > 0) {
           setAddress(accounts[0]);
           setProvider(eth);
+          setChainId(await readChainId(eth));
         }
       })
       .catch(() => {
@@ -151,17 +164,23 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const eth = (window as any).ethereum;
     if (!eth) return;
-    const onAccounts = (accs: string[]) => {
+    const onAccounts = async (accs: string[]) => {
       if (accs.length === 0) {
         setAddress(null);
         setProvider(null);
         setBalanceWei(null);
+        setChainId(null);
       } else {
         setAddress(accs[0]);
         setProvider(eth);
+        setChainId(await readChainId(eth));
       }
     };
-    const onChain = () => window.location.reload();
+    // Track the chain instead of reloading, so the banner can react in place.
+    const onChain = (hex: string) => {
+      const id = typeof hex === "string" ? parseInt(hex, 16) : NaN;
+      setChainId(Number.isNaN(id) ? null : id);
+    };
     eth.on("accountsChanged", onAccounts);
     eth.on("chainChanged", onChain);
     return () => {
@@ -195,7 +214,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [address, network]);
+  }, [address, network, chainId]);
+
+  const wrongChain = address !== null && chainId !== null && chainId !== expectedChainId;
 
   const value = useMemo<Wallet>(
     () => ({
@@ -204,11 +225,28 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       address,
       balanceWei,
       provider,
+      chainId,
+      expectedChainId,
+      wrongChain,
       connect,
       disconnect,
       ensureChain,
+      switchChain,
     }),
-    [network, setNetwork, address, balanceWei, provider, connect, disconnect, ensureChain],
+    [
+      network,
+      setNetwork,
+      address,
+      balanceWei,
+      provider,
+      chainId,
+      expectedChainId,
+      wrongChain,
+      connect,
+      disconnect,
+      ensureChain,
+      switchChain,
+    ],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

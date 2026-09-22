@@ -29,6 +29,44 @@ interface Detail {
   bets: Bet[];
 }
 
+function estPayout(bet: Bet, market: Market): bigint {
+  if (market.status !== "resolved" || !market.outcome) return 0n;
+  if (market.outcome === "void") return bet.amount;
+  if (bet.side !== market.outcome) return 0n;
+  const totalPool = market.pool_yes + market.pool_no;
+  const winPool = market.outcome === "yes" ? market.pool_yes : market.pool_no;
+  if (winPool === 0n) return 0n;
+  const gross = (bet.amount * totalPool) / winPool;
+  const fee = (gross * BigInt(market.fee_bps)) / 10000n;
+  return gross - fee;
+}
+
+function UrgencyCountdown({ target, now, label }: { target: number; now: number; label: string }) {
+  const remaining = target - now;
+  const isPast = remaining < 0;
+  const abs = Math.abs(remaining);
+  const h = Math.floor(abs / 3600);
+  const m = Math.floor((abs % 3600) / 60);
+  const s = abs % 60;
+  const timeStr = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+  const colorClass = isPast
+    ? "text-zinc-500"
+    : abs < 3600
+      ? "text-rose-400 animate-pulse"
+      : abs < 86400
+        ? "text-amber-400"
+        : "text-emerald-400";
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-zinc-500">{label}:</span>
+      <span className={`font-mono font-semibold ${colorClass}`}>
+        {isPast ? `${timeStr} ago` : timeStr}
+      </span>
+    </div>
+  );
+}
+
 export function MarketDetail() {
   const { id = "" } = useParams();
   const marketId = decodeURIComponent(id);
@@ -39,6 +77,7 @@ export function MarketDetail() {
   const [txMsg, setTxMsg] = useState<{ label: string; hash: string; extra?: string } | null>(null);
   const [actionErr, setActionErr] = useState<string | null>(null);
   const [disputeReason, setDisputeReason] = useState("");
+  const [copied, setCopied] = useState(false);
 
   const detail = useLoader<Detail>(async () => {
     const [market, odds, betIds] = await Promise.all([
@@ -50,27 +89,19 @@ export function MarketDetail() {
     return { market, odds, bets };
   }, [network, marketId]);
 
-  // Live refresh every 15s.
   useEffect(() => {
     const t = setInterval(() => detail.reload(), 15000);
     return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [network, marketId]);
 
   async function run(label: string, fn: () => Promise<{ ok: boolean; hash: string; revertReason: string | null; result: unknown }>) {
-    if (!address) {
-      setActionErr("Connect a wallet first.");
-      return;
-    }
+    if (!address) { setActionErr("Connect a wallet first."); return; }
     setBusy(label);
     setActionErr(null);
     setTxMsg(null);
     try {
       const out = await fn();
-      if (!out.ok) {
-        setActionErr(out.revertReason ?? `${label} reverted`);
-        return;
-      }
+      if (!out.ok) { setActionErr(out.revertReason ?? `${label} reverted`); return; }
       setTxMsg({ label, hash: out.hash, extra: out.result !== null && typeof out.result !== "boolean" ? String(out.result) : undefined });
       detail.reload();
     } catch (e) {
@@ -80,9 +111,28 @@ export function MarketDetail() {
     }
   }
 
+  function shareMarket() {
+    const url = `${window.location.origin}/markets/${encodeURIComponent(marketId)}`;
+    navigator.clipboard.writeText(url).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {
+      const el = document.createElement("input");
+      el.value = url;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand("copy");
+      document.body.removeChild(el);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+
   const m = detail.data?.market ?? null;
-  const myBets = (detail.data?.bets ?? []).filter((b) => address && sameAddress(b.bettor, address));
+  const bets = detail.data?.bets ?? [];
+  const myBets = bets.filter((b) => address && sameAddress(b.bettor, address));
   const disputeOpen = m?.status === "resolved" && m.resolved_at > 0 && now <= m.resolved_at + 86400;
+  const sortedBets = [...bets].sort((a, b) => b.placed_at - a.placed_at);
 
   return (
     <div>
@@ -101,16 +151,38 @@ export function MarketDetail() {
                 <StatusBadge status={m.status} />
                 <OutcomeBadge outcome={m.outcome} />
                 <CategoryBadge category={m.category} />
+                <button
+                  onClick={shareMarket}
+                  className="ml-auto flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-400 transition hover:bg-white/10 hover:text-zinc-200"
+                >
+                  <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+                  </svg>
+                  {copied ? "Copied!" : "Share"}
+                </button>
               </div>
               <p className="mt-3 text-sm leading-relaxed text-zinc-300">{m.description}</p>
               <div className="mt-3 grid gap-2 font-mono text-xs text-zinc-400 sm:grid-cols-2">
                 <div>source: <a href={m.resolution_url} target="_blank" rel="noreferrer" className="text-violet-300 hover:underline">{m.resolution_url}</a></div>
                 <div>creator: {shorten(m.creator)}</div>
-                <div>closes: {fmtDateTime(m.close_time)} ({countdown(m.close_time, now)})</div>
-                <div>resolvable: {fmtDateTime(m.resolve_time)} ({countdown(m.resolve_time, now)})</div>
-                {m.resolved_at > 0 && <div>resolved: {fmtDateTime(m.resolved_at)}</div>}
                 <div>fee: {(m.fee_bps / 100).toFixed(2)}%</div>
               </div>
+              {m.status === "open" && (
+                <div className="mt-3 flex flex-wrap gap-4 text-sm">
+                  <UrgencyCountdown target={m.close_time} now={now} label="Closes" />
+                  <UrgencyCountdown target={m.resolve_time} now={now} label="Resolvable" />
+                </div>
+              )}
+              {m.status === "locked" && (
+                <div className="mt-3 flex flex-wrap gap-4 text-sm">
+                  <UrgencyCountdown target={m.resolve_time} now={now} label="Resolvable" />
+                </div>
+              )}
+              {m.status === "resolved" && m.resolved_at > 0 && (
+                <div className="mt-3 text-sm text-zinc-500">
+                  Resolved {fmtDateTime(m.resolved_at)}
+                </div>
+              )}
               {m.resolver_note && (
                 <div className="mt-3 rounded-xl bg-sky-400/10 p-3 text-xs leading-relaxed text-sky-200">
                   <span className="font-semibold">Resolver: </span>{m.resolver_note}
@@ -120,25 +192,44 @@ export function MarketDetail() {
               <div className="mt-2 flex flex-wrap gap-4 font-mono text-xs text-zinc-400">
                 <span>YES pool: {fmtGen(m.pool_yes)}</span>
                 <span>NO pool: {fmtGen(m.pool_no)}</span>
-                <span>bets: {detail.data?.bets.length ?? 0}</span>
+                <span>bets: {bets.length}</span>
               </div>
             </Card>
 
             <Card>
-              <h3 className="font-semibold text-white">Bets ({detail.data?.bets.length ?? 0})</h3>
-              {(detail.data?.bets.length ?? 0) === 0 ? (
+              <h3 className="font-semibold text-white">Bets ({bets.length})</h3>
+              {bets.length === 0 ? (
                 <div className="mt-2 text-sm text-zinc-500">No bets yet.</div>
               ) : (
                 <div className="mt-3 space-y-2">
-                  {detail.data?.bets.map((b) => (
-                    <div key={b.id} className="flex flex-wrap items-center gap-2 rounded-xl bg-white/[0.03] p-3 font-mono text-xs">
-                      <span className={`font-bold uppercase ${b.side === "yes" ? "text-emerald-300" : "text-rose-300"}`}>{b.side}</span>
-                      <span className="text-zinc-200">{fmtGen(b.amount)}</span>
-                      <span className="text-zinc-500">{shorten(b.bettor)}</span>
-                      {b.claimed && <span className="text-zinc-500">claimed</span>}
-                      {address && sameAddress(b.bettor, address) && <span className="text-violet-300">you</span>}
-                    </div>
-                  ))}
+                  {sortedBets.map((b) => {
+                    const isWinner = m.status === "resolved" && m.outcome && b.side === m.outcome;
+                    const isLoser = m.status === "resolved" && m.outcome && m.outcome !== "void" && b.side !== m.outcome;
+                    const payout = estPayout(b, m);
+                    return (
+                      <div
+                        key={b.id}
+                        className={`flex flex-wrap items-center gap-2 rounded-xl p-3 font-mono text-xs ${
+                          isWinner ? "border border-emerald-500/30 bg-emerald-500/10"
+                            : isLoser ? "bg-white/[0.02] opacity-60"
+                              : "bg-white/[0.03]"
+                        }`}
+                      >
+                        <span className={`font-bold uppercase ${b.side === "yes" ? "text-emerald-300" : "text-rose-300"}`}>{b.side}</span>
+                        <span className="text-zinc-200">{fmtGen(b.amount)}</span>
+                        <span className="text-zinc-500">{shorten(b.bettor)}</span>
+                        {address && sameAddress(b.bettor, address) && <span className="text-violet-300">you</span>}
+                        {isWinner && payout > 0n && (
+                          <span className="ml-auto font-semibold text-emerald-300">+{fmtGen(payout)}</span>
+                        )}
+                        {isLoser && <span className="ml-auto text-zinc-500">lost</span>}
+                        {b.claimed && <span className="text-zinc-500">claimed</span>}
+                        <span className="text-zinc-600" title={fmtDateTime(b.placed_at)}>
+                          {countdown(b.placed_at, now)}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </Card>
@@ -161,12 +252,14 @@ export function MarketDetail() {
                     {busy === "AI resolve" ? "AI resolving (minutes)…" : "Request AI resolution"}
                   </Btn>
                 )}
-                {(m.status === "open" || m.status === "locked") && address &&
-                  (sameAddress(m.creator, address)) && (
+                {(m.status === "open" || m.status === "locked") && address && sameAddress(m.creator, address) && (
                   <Btn variant="danger" className="w-full" disabled={busy !== null} onClick={() => address && run("Void", () => voidMarket(network, address, provider, m.id))}>
                     Void market
                   </Btn>
                 )}
+                <Btn variant="ghost" className="w-full" onClick={shareMarket}>
+                  {copied ? "Link copied!" : "Share market"}
+                </Btn>
               </div>
               {actionErr && <div className="mt-3 rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">{actionErr}</div>}
               {txMsg && (
@@ -182,32 +275,29 @@ export function MarketDetail() {
               <Card>
                 <h3 className="font-semibold text-white">Your bets ({myBets.length})</h3>
                 <div className="mt-3 space-y-2">
-                  {myBets.map((b) => (
-                    <div key={b.id} className="rounded-xl bg-white/[0.03] p-3 text-xs">
-                      <div className="flex justify-between font-mono">
-                        <span className={`font-bold uppercase ${b.side === "yes" ? "text-emerald-300" : "text-rose-300"}`}>{b.side} · {fmtGen(b.amount)}</span>
-                        {b.claimed && <span className="text-zinc-500">claimed</span>}
+                  {myBets.map((b) => {
+                    const isWinner = m.status === "resolved" && m.outcome && b.side === m.outcome;
+                    const payout = estPayout(b, m);
+                    return (
+                      <div key={b.id} className={`rounded-xl p-3 text-xs ${isWinner ? "border border-emerald-500/30 bg-emerald-500/10" : "bg-white/[0.03]"}`}>
+                        <div className="flex justify-between font-mono">
+                          <span className={`font-bold uppercase ${b.side === "yes" ? "text-emerald-300" : "text-rose-300"}`}>{b.side} · {fmtGen(b.amount)}</span>
+                          {isWinner && payout > 0n && <span className="font-semibold text-emerald-300">+{fmtGen(payout)}</span>}
+                          {b.claimed && <span className="text-zinc-500">claimed</span>}
+                        </div>
+                        {!b.claimed && m.status === "resolved" && (
+                          <Btn className="mt-2 w-full" disabled={busy !== null} onClick={() => address && run("Claim", () => claimWinnings(network, address, provider, b.id))}>
+                            Claim winnings
+                          </Btn>
+                        )}
+                        {!b.claimed && m.status === "voided" && (
+                          <Btn className="mt-2 w-full" disabled={busy !== null} onClick={() => address && run("Refund", () => refundVoid(network, address, provider, b.id))}>
+                            Refund (voided)
+                          </Btn>
+                        )}
                       </div>
-                      {!b.claimed && m.status === "resolved" && (
-                        <Btn
-                          className="mt-2 w-full"
-                          disabled={busy !== null}
-                          onClick={() => address && run("Claim", () => claimWinnings(network, address, provider, b.id))}
-                        >
-                          Claim winnings
-                        </Btn>
-                      )}
-                      {!b.claimed && m.status === "voided" && (
-                        <Btn
-                          className="mt-2 w-full"
-                          disabled={busy !== null}
-                          onClick={() => address && run("Refund", () => refundVoid(network, address, provider, b.id))}
-                        >
-                          Refund (voided)
-                        </Btn>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </Card>
             )}
@@ -222,12 +312,7 @@ export function MarketDetail() {
                   <Field label="Reason">
                     <input value={disputeReason} onChange={(e) => setDisputeReason(e.target.value)} placeholder="Primary source misread…" className={inputCls} />
                   </Field>
-                  <Btn
-                    variant="danger"
-                    className="w-full"
-                    disabled={busy !== null || !disputeReason.trim()}
-                    onClick={() => address && run("Dispute", () => raiseDispute(network, address, provider, m.id, disputeReason.trim()))}
-                  >
+                  <Btn variant="danger" className="w-full" disabled={busy !== null || !disputeReason.trim()} onClick={() => address && run("Dispute", () => raiseDispute(network, address, provider, m.id, disputeReason.trim()))}>
                     Submit dispute
                   </Btn>
                 </div>
@@ -237,14 +322,7 @@ export function MarketDetail() {
         </div>
       )}
       {betOpen && m && (
-        <PlaceBetModal
-          market={m}
-          onClose={() => setBetOpen(false)}
-          onPlaced={() => {
-            setBetOpen(false);
-            detail.reload();
-          }}
-        />
+        <PlaceBetModal market={m} onClose={() => setBetOpen(false)} onPlaced={() => { setBetOpen(false); detail.reload(); }} />
       )}
     </div>
   );

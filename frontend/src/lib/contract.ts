@@ -1,6 +1,16 @@
 import type { NetworkKey } from "./chains";
 import { toBigInt, toBool, toNumber, toStr } from "./format";
-import { contractAddress, decode, getClient, sendWrite, type TxOutcome } from "./genlayer";
+import {
+  contractAddress,
+  decode,
+  getClient,
+  guardRateLimit,
+  noteFailurePublic,
+  sendWrite,
+  viewCacheGet,
+  viewCacheSet,
+  type TxOutcome,
+} from "./genlayer";
 
 export interface Market {
   id: string;
@@ -71,13 +81,24 @@ export interface PlatformStats {
 }
 
 async function view<T>(network: NetworkKey, method: string, args: unknown[] = []): Promise<T> {
+  guardRateLimit(); // fail fast while the rate-limit cooldown is active
+
+  const cached = viewCacheGet<T>(network, method, args);
+  if (cached !== null) return cached;
+
   const client = getClient(network);
-  const raw = await client.readContract({
-    address: contractAddress() as `0x${string}`,
-    functionName: method,
-    args: args as never[],
-  });
-  return decode<T>(raw);
+  try {
+    const raw = await client.readContract({
+      address: contractAddress() as `0x${string}`,
+      functionName: method,
+      args: args as never[],
+    });
+    viewCacheSet(network, method, args, raw);
+    return decode<T>(raw);
+  } catch (err) {
+    noteFailurePublic(err); // engages rate-limit cooldown on 429 bursts
+    throw err;
+  }
 }
 
 function normMarket(m: Record<string, unknown>): Market {

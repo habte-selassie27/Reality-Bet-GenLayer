@@ -4,6 +4,7 @@ import { MarketCard } from "../components/MarketCard";
 import { EmptyState, ErrorBox, inputCls, PageHeader, Spinner } from "../components/ui";
 import { getMarket, type Market } from "../lib/contract";
 import { useLoader } from "../lib/hooks";
+import { guardRateLimit, readErrorMessage } from "../lib/genlayer";
 import { addMarket, listMarkets } from "../lib/market-registry";
 import { useWallet } from "../lib/wallet";
 
@@ -16,10 +17,25 @@ export function Markets() {
   const [ids, setIds] = useState<string[]>(() => listMarkets(network));
 
   const markets = useLoader(async () => {
+    guardRateLimit(); // fail fast (friendly message) while cooldown is active
     const results = await Promise.allSettled(ids.map((id) => getMarket(network, id)));
     return results.flatMap((r, i) => {
-      if (r.status === "fulfilled") return [{ ...r.value, _missing: false }];
-      return [{ id: ids[i], _missing: true } as unknown as Market & { _missing: boolean }];
+      if (r.status === "fulfilled") return [{ ...r.value, _missing: false, _rateLimited: false }];
+      const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      // Contract said the id doesn't exist — a real miss.
+      if (/Market not found/i.test(msg)) {
+        return [{ id: ids[i], _missing: true, _rateLimited: false } as unknown as Market & { _missing: boolean; _rateLimited: boolean }];
+      }
+      // Network/CORS/429 failures are rate-limit symptoms, not missing markets.
+      const rateLimited = /rate-limited|rate limit|Too Many Requests|429|Failed to fetch|fetch failed|network|CORS/i.test(msg);
+      return [{
+        id: ids[i],
+        _missing: false,
+        _rateLimited: rateLimited,
+        _error: rateLimited
+          ? "Studio RPC rate-limited — retry in a few minutes."
+          : readErrorMessage(r.reason),
+      } as unknown as Market & { _missing: boolean; _rateLimited: boolean; _error?: string }];
     });
   }, [network, ids]);
 
@@ -97,16 +113,32 @@ export function Markets() {
         />
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
-          {visible.map((m) =>
-            (m as Market & { _missing?: boolean })._missing ? (
-              <div key={m.id} className="rounded-2xl border border-white/5 bg-white/[0.02] p-5">
-                <div className="font-mono text-sm text-zinc-400">{m.id}</div>
-                <div className="mt-1 text-xs text-zinc-500">Market not found on this network.</div>
-              </div>
-            ) : (
-              <MarketCard key={m.id} market={m as Market} />
-            ),
-          )}
+          {visible.map((m) => {
+            const row = m as Market & { _missing?: boolean; _rateLimited?: boolean; _error?: string };
+            if (row._rateLimited) {
+              return (
+                <div key={m.id} className="rounded-2xl border border-amber-500/30 bg-amber-500/5 p-5">
+                  <div className="font-mono text-sm text-zinc-400">{m.id}</div>
+                  <div className="mt-1 text-xs text-amber-300">{row._error}</div>
+                  <button
+                    onClick={markets.reload}
+                    className="mt-3 rounded-lg border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-500/10"
+                  >
+                    Retry
+                  </button>
+                </div>
+              );
+            }
+            if (row._missing) {
+              return (
+                <div key={m.id} className="rounded-2xl border border-white/5 bg-white/[0.02] p-5">
+                  <div className="font-mono text-sm text-zinc-400">{m.id}</div>
+                  <div className="mt-1 text-xs text-zinc-500">Market not found on this network.</div>
+                </div>
+              );
+            }
+            return <MarketCard key={m.id} market={m} />;
+          })}
         </div>
       )}
     </div>

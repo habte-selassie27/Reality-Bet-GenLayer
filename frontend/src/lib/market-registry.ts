@@ -2,22 +2,53 @@ import { SEED_MARKETS, type NetworkKey } from "./chains";
 
 const KEY = "realitybet.markets.v1";
 
+/** Known test/probe markets to exclude from the registry. */
+const EXCLUDED = new Set(["m2-1789988760", "m3-1789988982", "m5-1789989445", "m7-1789990765"]);
+
 /** Registry is per-network so Studio and testnet markets don't mix. */
 function scopedKey(network: NetworkKey): string {
   return `${KEY}.${network}`;
 }
 
 export function listMarkets(network: NetworkKey): string[] {
+  let saved: string[] = [];
   try {
     const raw = localStorage.getItem(scopedKey(network));
     if (raw) {
       const arr = JSON.parse(raw) as unknown;
-      if (Array.isArray(arr)) return arr.filter((x): x is string => typeof x === "string");
+      if (Array.isArray(arr)) saved = arr.filter((x): x is string => typeof x === "string");
     }
   } catch {
-    // storage unavailable — fall back to seeds
+    /* storage unavailable */
   }
-  return [...SEED_MARKETS];
+
+  // Merge: start with saved, prepend any new seeds not already present.
+  const seen = new Set(saved);
+  const merged: string[] = [...saved];
+  for (const id of SEED_MARKETS) {
+    if (!seen.has(id)) merged.unshift(id);
+  }
+
+  // Filter out known test/probe markets and deduplicate.
+  const out: string[] = [];
+  const outSeen = new Set<string>();
+  for (const id of merged) {
+    if (!EXCLUDED.has(id) && !outSeen.has(id)) {
+      out.push(id);
+      outSeen.add(id);
+    }
+  }
+
+  // Persist the cleaned list back.
+  if (out.length !== saved.length || out.some((id, i) => id !== saved[i])) {
+    try {
+      localStorage.setItem(scopedKey(network), JSON.stringify(out));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return out;
 }
 
 export function addMarket(network: NetworkKey, id: string) {

@@ -1,9 +1,7 @@
 import { createClient } from "genlayer-js";
 import { TransactionStatus } from "genlayer-js/types";
 import type { Hash } from "genlayer-js/types";
-import { encodeFunctionData, type Abi } from "viem";
 import { CONTRACT_ADDRESS, NETWORKS, type NetworkKey } from "./chains";
-import { REALITY_BET_ABI } from "./abi";
 
 type Client = ReturnType<typeof createClient>;
 
@@ -102,19 +100,53 @@ export interface TxOutcome<T> {
   revertReason: string | null;
 }
 
-/** Pull `{execution_result, result.payload.readable}` out of a receipt shape. */
-function parseReceipt(receipt: unknown): { execution: string; readable: string | null } {
+interface ReceiptInfo {
+  /** Leader execution result, e.g. SUCCESS / ERROR. */
+  execution: string;
+  /** VM result status: return | rollback | contract_error | error | none. */
+  status: string | null;
+  /** Decoded return value (status "return") or revert message (status is an error). */
+  readable: string | null;
+  /** Lower-level GenVM error text, when the VM itself failed. */
+  vmError: string | null;
+}
+
+/**
+ * Read the outcome out of a GenLayer receipt.
+ *
+ * Studio decodes `leader_receipt[0].result` into `{ raw, status, payload }`: on
+ * success the payload is `{ readable }`, while a revert carries the message
+ * directly as a string. `genvm_result` holds VM-level errors.
+ */
+function parseReceipt(receipt: unknown): ReceiptInfo {
   try {
     const r = receipt as Record<string, unknown>;
     const cd = r["consensus_data"] as Record<string, unknown> | undefined;
     const leader = (cd?.["leader_receipt"] as Array<Record<string, unknown>> | undefined)?.[0];
-    const execution = String(leader?.["execution_result"] ?? "UNKNOWN");
-    const res = leader?.["result"] as Record<string, unknown> | undefined;
-    const payload = res?.["payload"] as Record<string, unknown> | undefined;
-    const readable = typeof payload?.["readable"] === "string" ? (payload["readable"] as string) : null;
-    return { execution, readable };
+    if (!leader) return { execution: "UNKNOWN", status: null, readable: null, vmError: null };
+
+    const execution = String(leader["execution_result"] ?? "UNKNOWN");
+    const res = leader["result"] as Record<string, unknown> | undefined;
+    const status = typeof res?.["status"] === "string" ? (res["status"] as string) : null;
+    const payload = res?.["payload"];
+    const readable =
+      typeof payload === "string"
+        ? payload
+        : typeof (payload as Record<string, unknown> | undefined)?.["readable"] === "string"
+          ? ((payload as Record<string, unknown>)["readable"] as string)
+          : null;
+
+    const genvm = leader["genvm_result"] as Record<string, unknown> | undefined;
+    const vmError =
+      typeof genvm?.["error_data"] === "string" && genvm["error_data"]
+        ? (genvm["error_data"] as string)
+        : typeof genvm?.["stderr"] === "string" && genvm["stderr"]
+          ? (genvm["stderr"] as string)
+          : null;
+
+    return { execution, status, readable, vmError };
   } catch {
-    return { execution: "UNKNOWN", readable: null };
+    return { execution: "UNKNOWN", status: null, readable: null, vmError: null };
   }
 }
 
@@ -128,16 +160,26 @@ export function parseReadable<T>(readable: string | null): T | null {
   }
 }
 
-function revertFromReadable(readable: string | null): string | null {
-  if (!readable) return null;
-  const parsed = parseReadable<string>(readable);
-  return typeof parsed === "string" && parsed.length > 0 ? parsed : readable;
+/** `fullTransaction` is supported at runtime but missing from the SDK types. */
+interface ReceiptClient {
+  waitForTransactionReceipt(args: {
+    hash: Hash;
+    status?: TransactionStatus;
+    interval?: number;
+    retries?: number;
+    fullTransaction?: boolean;
+  }): Promise<unknown>;
 }
 
 /**
- * Send a write transaction directly via MetaMask's eth_sendTransaction,
- * bypassing the SDK's writeContract which has chainId mismatch issues.
- * Then poll the GenLayer SDK for the finalized receipt.
+ * Send a state-changing call and wait for it to finalize.
+ *
+ * A GenLayer write is not an EVM call to the contract address: the SDK encodes
+ * the method and submits it through the consensus contract's `addTransaction`.
+ * Hand-encoding ABI calldata and sending it straight to the contract (as this
+ * used to do) reverts, because the EVM tx never enters consensus. The wallet is
+ * switched to the right chain first, so the `chainId` the SDK attaches is the
+ * one the wallet is already on.
  */
 export async function sendWrite<T>(opts: {
   network: NetworkKey;
@@ -150,39 +192,41 @@ export async function sendWrite<T>(opts: {
 }): Promise<TxOutcome<T>> {
   await ensureChain(opts.provider, opts.network);
 
-  const data = encodeFunctionData({
-    abi: REALITY_BET_ABI as Abi,
-    functionName: opts.method,
-    args: (opts.args ?? []) as never[],
+  const client = createClient({
+    chain: NETWORKS[opts.network].chain,
+    account: opts.address as `0x${string}`,
+    provider: opts.provider,
   });
 
-  const txParams: Record<string, unknown> = {
-    from: opts.address,
-    to: contractAddress(),
-    data,
-  };
-  if (opts.value && opts.value > 0n) {
-    txParams.value = "0x" + opts.value.toString(16);
-  }
-
-  const hash = (await opts.provider.request({
-    method: "eth_sendTransaction",
-    params: [txParams],
+  const hash = (await client.writeContract({
+    address: contractAddress() as `0x${string}`,
+    functionName: opts.method,
+    args: (opts.args ?? []) as never[],
+    value: opts.value ?? 0n,
   })) as string;
 
-  const client = getClient(opts.network);
   const waitMs = opts.waitMs ?? 1000 * 60 * 8;
   const retries = Math.max(1, Math.floor(waitMs / 5000));
-  const receipt = await client.waitForTransactionReceipt({
+  const receipt = await (client as unknown as ReceiptClient).waitForTransactionReceipt({
     hash: hash as Hash,
     status: TransactionStatus.FINALIZED,
     interval: 5000,
     retries,
+    // Keeps consensus_data.leader_receipt[0].result, which the simplified
+    // receipt drops — and that is where the return value / revert reason lives.
+    fullTransaction: true,
   });
 
-  const { execution, readable } = parseReceipt(receipt);
-  if (execution === "SUCCESS") {
+  const { execution, status, readable, vmError } = parseReceipt(receipt);
+  const ok = status !== null ? status === "return" : execution === "SUCCESS";
+  if (ok) {
     return { hash, ok: true, result: parseReadable<T>(readable), execution, revertReason: null };
   }
-  return { hash, ok: false, result: null, execution, revertReason: revertFromReadable(readable) ?? "Transaction reverted" };
+  return {
+    hash,
+    ok: false,
+    result: null,
+    execution,
+    revertReason: readable ?? vmError ?? `Transaction ${status ?? execution}`,
+  };
 }

@@ -9,6 +9,7 @@ export interface Market {
   description: string;
   resolution_url: string;
   category: string;
+  categories: string[];
   close_time: number;
   resolve_time: number;
   outcome: string;
@@ -87,6 +88,11 @@ function normMarket(m: Record<string, unknown>): Market {
     description: toStr(m["description"]),
     resolution_url: toStr(m["resolution_url"]),
     category: toStr(m["category"]),
+    categories: Array.isArray(m["categories"])
+      ? (m["categories"] as unknown[]).map(toStr)
+      : toStr(m["category"])
+        ? [toStr(m["category"])]
+        : [],
     close_time: toNumber(m["close_time"]),
     resolve_time: toNumber(m["resolve_time"]),
     outcome: toStr(m["outcome"]),
@@ -197,8 +203,8 @@ export const createMarket = (
   network: NetworkKey,
   address: string,
   provider: any,
-  p: { title: string; description: string; resolution_url: string; category: string; close_time: number; resolve_time: number },
-) => write<string>(network, address, provider, "create_market", [p.title, p.description, p.resolution_url, p.category, p.close_time, p.resolve_time]);
+  p: { title: string; description: string; resolution_url: string; categories: string[]; close_time: number; resolve_time: number },
+) => write<string>(network, address, provider, "create_market", [p.title, p.description, p.resolution_url, p.categories, p.close_time, p.resolve_time]);
 
 export const lockMarket = (network: NetworkKey, address: string, provider: any, marketId: string) =>
   write<boolean>(network, address, provider, "lock_market", [marketId]);

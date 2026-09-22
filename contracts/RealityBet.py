@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 import json
 import typing
 
-
 class MarketStatus:
     OPEN = "open"
     LOCKED = "locked"
@@ -19,14 +18,11 @@ class Outcome:
     NO = "no"
     VOID = "void"
 
-
 class Category:
-    SPORTS = "sports"
-    POLITICS = "politics"
-    CRYPTO = "crypto"
-    TECH = "tech"
-    SCIENCE = "science"
-    CUSTOM = "custom"
+    ALL = ["sports", "politics", "crypto", "tech", "science", "entertainment",
+           "finance", "economy", "business", "world", "health", "weather",
+           "gaming", "esports", "social", "culture", "education", "environment",
+           "space", "custom"]
 
 
 @allow_storage
@@ -37,7 +33,7 @@ class Market:
     title: str
     description: str
     resolution_url: str
-    category: str
+    categories: DynArray[str]
     close_time: u256
     resolve_time: u256
     outcome: str
@@ -113,20 +109,29 @@ class RealityBet(gl.Contract):
 
     @gl.public.write
     def create_market(
-        self, title: str, description: str, resolution_url: str, category: str, close_time: u256, resolve_time: u256
+        self, title: str, description: str, resolution_url: str, categories: list[str], close_time: u256, resolve_time: u256
     ) -> str:
         now = self._now()
         if not close_time > now:
             raise gl.vm.UserError("Close time must be future")
         if not resolve_time >= close_time:
             raise gl.vm.UserError("Resolve after close")
-        if category not in [Category.SPORTS, Category.POLITICS, Category.CRYPTO, Category.TECH, Category.SCIENCE, Category.CUSTOM]:
-            raise gl.vm.UserError("Invalid category")
+        cats: list[str] = []
+        for c in categories:
+            c2 = str(c).lower().strip()
+            if c2 not in Category.ALL:
+                raise gl.vm.UserError("Invalid category")
+            if c2 not in cats:
+                cats.append(c2)
+        if len(cats) == 0:
+            raise gl.vm.UserError("At least one category")
+        if len(cats) > 5:
+            cats = cats[:5]
         mid = "m" + str(int(self.market_count)) + "-" + str(int(now))
         self.market_count = u256(int(self.market_count) + 1)
         self.markets[mid] = Market(
             mid, gl.message.sender_address, title, description, resolution_url,
-            category, close_time, resolve_time, "", MarketStatus.OPEN,
+            cats, close_time, resolve_time, "", MarketStatus.OPEN,
             u256(0), u256(0), self.platform_fee_bps, u256(0), "", "", "",
         )
         self.market_bets.get_or_insert_default(mid)
@@ -256,13 +261,11 @@ class RealityBet(gl.Contract):
 
     def _resolve(self, market_id: str) -> None:
         m = self._get_market(market_id)
-        title = m.title
-        desc = m.description
         url = m.resolution_url
-        cat = m.category
+        cat = ", ".join(m.categories)
         prompt = (
             "You are an impartial prediction market resolver with web access.\n"
-            'MARKET QUESTION: "' + title + '"\nDESCRIPTION: ' + desc + "\n"
+            'MARKET QUESTION: "' + m.title + '"\nDESCRIPTION: ' + m.description + "\n"
             "CRITERIA: YES if event clearly occurred. NO if clearly NOT occurred. "
             "VOID only if ambiguous, source unavailable, or unanswerable.\n"
             "PRIMARY SOURCE: " + url + "\nCATEGORY: " + cat + "\n"
@@ -409,14 +412,15 @@ class RealityBet(gl.Contract):
     @gl.public.view
     def get_market(self, market_id: str) -> dict:
         m = self._get_market(market_id)
+        cats = list(m.categories)
         return {"id": m.id, "creator": format(m.creator, "x"), "title": m.title,
                 "description": m.description, "resolution_url": m.resolution_url,
-                "category": m.category, "close_time": int(m.close_time),
-                "resolve_time": int(m.resolve_time), "outcome": m.outcome,
-                "status": m.status, "pool_yes": int(m.pool_yes), "pool_no": int(m.pool_no),
+                "category": cats[0] if len(cats) > 0 else "custom", "categories": cats,
+                "close_time": int(m.close_time), "resolve_time": int(m.resolve_time),
+                "outcome": m.outcome, "status": m.status,
+                "pool_yes": int(m.pool_yes), "pool_no": int(m.pool_no),
                 "fee_bps": int(m.fee_bps), "resolved_at": int(m.resolved_at),
-                "resolver_note": m.resolver_note,
-                "resolver_confidence": m.resolver_confidence,
+                "resolver_note": m.resolver_note, "resolver_confidence": m.resolver_confidence,
                 "resolver_sources": m.resolver_sources}
 
     @gl.public.view
@@ -461,9 +465,7 @@ class RealityBet(gl.Contract):
     @gl.public.view
     def get_market_stats(self, market_id: str) -> dict:
         m = self._get_market(market_id)
-        bids: typing.Any = []
-        if market_id in self.market_bets:
-            bids = list(self.market_bets[market_id])
+        bids: typing.Any = list(self.market_bets[market_id]) if market_id in self.market_bets else []
         yc = 0
         nc = 0
         for bid in bids:

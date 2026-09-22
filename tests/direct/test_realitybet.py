@@ -6,12 +6,12 @@ def _ts(iso):
     return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
 
 
-def _make_market(contract, close_ts, resolve_ts):
+def _make_market(contract, close_ts, resolve_ts, categories=None):
     return contract.create_market(
         "Will BTC close above $100k on Dec 31 2025?",
         "Resolves YES if BTC closes above 100k.",
         "https://coinmarketcap.com/currencies/bitcoin/",
-        "crypto",
+        categories if categories is not None else ["crypto"],
         close_ts,
         resolve_ts,
     )
@@ -43,6 +43,43 @@ def test_create_market(direct_vm, direct_deploy, direct_owner):
     assert m["outcome"] == ""
     assert m["pool_yes"] == 0 and m["pool_no"] == 0
     assert m["resolver_confidence"] == "" and m["resolver_sources"] == ""
+    assert m["categories"] == ["crypto"]
+    assert m["category"] == "crypto"
+
+
+def test_create_market_multi_categories(direct_vm, direct_deploy, direct_owner):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    direct_vm.warp("2025-01-01T00:00:00Z")
+    now = _ts("2025-01-01T00:00:00Z")
+    mid = _make_market(contract, now + 1000, now + 2000, ["crypto", "finance", "economy"])
+    m = contract.get_market(mid)
+    assert m["categories"] == ["crypto", "finance", "economy"]
+    assert m["category"] == "crypto"
+
+
+def test_create_market_dedupes_and_caps_categories(direct_vm, direct_deploy, direct_owner):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    direct_vm.warp("2025-01-01T00:00:00Z")
+    now = _ts("2025-01-01T00:00:00Z")
+    mid = _make_market(
+        contract, now + 1000, now + 2000,
+        ["Crypto", "crypto", "sports", "tech", "science", "world", "custom"],
+    )
+    m = contract.get_market(mid)
+    assert m["categories"] == ["crypto", "sports", "tech", "science", "world"]
+
+
+def test_create_market_invalid_category_reverts(direct_vm, direct_deploy, direct_owner):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    direct_vm.warp("2025-01-01T00:00:00Z")
+    now = _ts("2025-01-01T00:00:00Z")
+    with direct_vm.expect_revert("Invalid category"):
+        _make_market(contract, now + 1000, now + 2000, ["crypto", "not-a-category"])
+    with direct_vm.expect_revert("At least one category"):
+        _make_market(contract, now + 1000, now + 2000, [])
 
 
 def test_place_bet_yes_no(direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob):

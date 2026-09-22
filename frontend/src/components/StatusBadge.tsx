@@ -31,10 +31,18 @@ export function OutcomeBadge({ outcome }: { outcome: string }) {
   );
 }
 
-export function CategoryBadge({ category }: { category: string }) {
+export function CategoryBadge({ categories }: { categories: string[] }) {
+  const list = categories.length > 0 ? categories : ["custom"];
   return (
-    <span className="inline-block rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-xs text-zinc-300">
-      {category || "custom"}
-    </span>
+    <>
+      {list.map((c) => (
+        <span
+          key={c}
+          className="inline-block rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-xs text-zinc-300"
+        >
+          {c}
+        </span>
+      ))}
+    </>
   );
 }

@@ -4,7 +4,13 @@ import { addMarket } from "../lib/market-registry";
 import { useWallet } from "../lib/wallet";
 import { Btn, Field, inputCls, TxHash } from "./ui";
 
-const CATEGORIES = ["crypto", "sports", "politics", "tech", "science", "custom"];
+const CATEGORIES = [
+  "sports", "politics", "crypto", "tech", "science", "entertainment",
+  "finance", "economy", "business", "world", "health", "weather",
+  "gaming", "esports", "social", "culture", "education", "environment",
+  "space", "custom",
+];
+const MAX_CATEGORIES = 5;
 
 function toUnix(dtLocal: string): number | null {
   const ms = new Date(dtLocal).getTime();
@@ -30,7 +36,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [url, setUrl] = useState("https://");
-  const [category, setCategory] = useState("crypto");
+  const [categories, setCategories] = useState<string[]>(["crypto"]);
   const [close, setClose] = useState(defaultClose);
   const [resolve, setResolve] = useState(defaultResolve);
   const [busy, setBusy] = useState(false);
@@ -53,6 +59,10 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
       setError("Resolve time must be at or after close time.");
       return;
     }
+    if (categories.length === 0) {
+      setError("Pick at least one category.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -60,7 +70,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
         title: title.trim(),
         description: description.trim(),
         resolution_url: url.trim(),
-        category,
+        categories,
         close_time: closeTs,
         resolve_time: resolveTs,
       });
@@ -74,7 +84,7 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
       setTitle("");
       setDescription("");
       setUrl("https://");
-      setCategory("crypto");
+      setCategories(["crypto"]);
       setClose(defaultClose());
       setResolve(defaultResolve());
       onCreated(id);
@@ -97,14 +107,32 @@ export function CreateMarketForm({ onCreated }: { onCreated: (id: string) => voi
         <Field label="Primary source URL (AI checks this)">
           <input value={url} onChange={(e) => setUrl(e.target.value)} required type="url" className={`${inputCls} font-mono`} />
         </Field>
-        <Field label="Category">
-          <select value={category} onChange={(e) => setCategory(e.target.value)} className={inputCls}>
-            {CATEGORIES.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
+        <Field label={`Categories (${categories.length}/${MAX_CATEGORIES})`}>
+          <div className="flex flex-wrap gap-1.5">
+            {CATEGORIES.map((c) => {
+              const on = categories.includes(c);
+              const disabled = !on && categories.length >= MAX_CATEGORIES;
+              return (
+                <button
+                  key={c}
+                  type="button"
+                  disabled={disabled}
+                  onClick={() =>
+                    setCategories((prev) =>
+                      on ? prev.filter((x) => x !== c) : [...prev, c],
+                    )
+                  }
+                  className={`rounded-full border px-2.5 py-0.5 text-xs transition ${
+                    on
+                      ? "border-violet-400/60 bg-violet-500/20 text-violet-200"
+                      : "border-white/10 bg-white/5 text-zinc-400 hover:bg-white/10"
+                  } ${disabled ? "cursor-not-allowed opacity-40" : ""}`}
+                >
+                  {c}
+                </button>
+              );
+            })}
+          </div>
         </Field>
         <Field label="Betting closes">
           <input type="datetime-local" value={close} onChange={(e) => setClose(e.target.value)} required className={inputCls} />

@@ -34,7 +34,7 @@ export function MarketCard({ market }: { market: Market }) {
       <div className="flex flex-wrap items-center gap-2">
         <StatusBadge status={market.status} />
         <OutcomeBadge outcome={market.outcome} />
-        <CategoryBadge category={market.category} />
+        <CategoryBadge categories={market.categories} />
         {closingIn && market.status === "open" && (
           <span className="ml-auto text-xs text-zinc-400">closes in {closingIn}</span>
         )}

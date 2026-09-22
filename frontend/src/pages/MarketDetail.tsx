@@ -150,7 +150,7 @@ export function MarketDetail() {
               <div className="flex flex-wrap items-center gap-2">
                 <StatusBadge status={m.status} />
                 <OutcomeBadge outcome={m.outcome} />
-                <CategoryBadge category={m.category} />
+                <CategoryBadge categories={m.categories} />
                 <button
                   onClick={shareMarket}
                   className="ml-auto flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-400 transition hover:bg-white/10 hover:text-zinc-200"

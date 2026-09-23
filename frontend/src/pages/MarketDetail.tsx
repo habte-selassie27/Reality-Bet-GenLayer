@@ -6,10 +6,8 @@ import { CategoryBadge, OutcomeBadge, StatusBadge } from "../components/StatusBa
 import { Btn, Card, ErrorBox, Field, inputCls, PageHeader, Spinner, TxHash } from "../components/ui";
 import {
   claimWinnings,
-  getBet,
   getMarket,
-  getMarketBets,
-  getOdds,
+  getMarketBetsDetailed,
   lockMarket,
   raiseDispute,
   refundVoid,
@@ -80,17 +78,30 @@ export function MarketDetail() {
   const [copied, setCopied] = useState(false);
 
   const detail = useLoader<Detail>(async () => {
-    const [market, odds, betIds] = await Promise.all([
+    // Two reads: the market and every bet on it. Odds are pool math, so they
+    // are derived from the market we already have instead of a get_odds call.
+    const [market, bets] = await Promise.all([
       getMarket(network, marketId),
-      getOdds(network, marketId),
-      getMarketBets(network, marketId),
+      getMarketBetsDetailed(network, marketId),
     ]);
-    const bets = await Promise.all(betIds.map((b) => getBet(network, b)));
+    const total = market.pool_yes + market.pool_no;
+    const yes = total === 0n ? 50 : Number((market.pool_yes * 100n) / total);
+    const odds: Odds = {
+      yes,
+      no: 100 - yes,
+      pool_yes: market.pool_yes,
+      pool_no: market.pool_no,
+      total_pool: total,
+    };
     return { market, odds, bets };
   }, [network, marketId]);
 
+  // 60s (was 15s) and skipped while the tab is hidden: every reload costs two
+  // reads against an endpoint that allows 500 requests/hour.
   useEffect(() => {
-    const t = setInterval(() => detail.reload(), 15000);
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible") detail.reload();
+    }, 60_000);
     return () => clearInterval(t);
   }, [network, marketId]);
 

@@ -2,11 +2,17 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { MarketCard } from "../components/MarketCard";
 import { EmptyState, ErrorBox, inputCls, PageHeader, Spinner } from "../components/ui";
-import { getMarket, type Market } from "../lib/contract";
+import { getMarket, getMarketsPage, type Market } from "../lib/contract";
 import { useLoader } from "../lib/hooks";
 import { guardRateLimit, readErrorMessage } from "../lib/genlayer";
 import { addMarket, listMarkets } from "../lib/market-registry";
 import { useWallet } from "../lib/wallet";
+
+/** Rows that were added to the local registry but are missing on this network. */
+type Row = Market & { _missing?: boolean; _rateLimited?: boolean; _error?: string };
+
+/** The contract caps a page at 50; ask for the max in one call. */
+const MARKETS_PAGE = 50;
 
 export function Markets() {
   const { network } = useWallet();
@@ -16,27 +22,52 @@ export function Markets() {
   const [showImport, setShowImport] = useState(false);
   const [ids, setIds] = useState<string[]>(() => listMarkets(network));
 
-  const markets = useLoader(async () => {
+  const markets = useLoader<Row[]>(async () => {
     guardRateLimit(); // fail fast (friendly message) while cooldown is active
-    const results = await Promise.allSettled(ids.map((id) => getMarket(network, id)));
-    return results.flatMap((r, i) => {
-      if (r.status === "fulfilled") return [{ ...r.value, _missing: false, _rateLimited: false }];
+
+    const rows: Row[] = [];
+    const seen = new Set<string>();
+    let pageError: unknown = null;
+
+    // Every market on the contract comes back in a single call.
+    try {
+      for (const m of await getMarketsPage(network, 0, MARKETS_PAGE)) {
+        rows.push(m);
+        seen.add(m.id);
+      }
+    } catch (err) {
+      pageError = err;
+    }
+
+    // Registry ids (imported by hand, or created before these views existed)
+    // that the page did not cover.
+    const extra = ids.filter((id) => !seen.has(id));
+    const results = await Promise.allSettled(extra.map((id) => getMarket(network, id)));
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        rows.push(r.value);
+        return;
+      }
       const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
       // Contract said the id doesn't exist — a real miss.
       if (/Market not found/i.test(msg)) {
-        return [{ id: ids[i], _missing: true, _rateLimited: false } as unknown as Market & { _missing: boolean; _rateLimited: boolean }];
+        rows.push({ id: extra[i], _missing: true } as Row);
+        return;
       }
       // Network/CORS/429 failures are rate-limit symptoms, not missing markets.
       const rateLimited = /rate-limited|rate limit|Too Many Requests|429|Failed to fetch|fetch failed|network|CORS/i.test(msg);
-      return [{
-        id: ids[i],
-        _missing: false,
+      rows.push({
+        id: extra[i],
         _rateLimited: rateLimited,
         _error: rateLimited
           ? "Studio RPC rate-limited — retry in a few minutes."
           : readErrorMessage(r.reason),
-      } as unknown as Market & { _missing: boolean; _rateLimited: boolean; _error?: string }];
+      } as Row);
     });
+
+    // Nothing loaded at all → surface the failure rather than "no markets".
+    if (rows.length === 0 && pageError) throw pageError;
+    return rows;
   }, [network, ids]);
 
   function refreshIds() {
@@ -44,8 +75,8 @@ export function Markets() {
   }
 
   const visible = (markets.data ?? []).filter((m) => {
-    if (statusFilter !== "all" && (m as Market).status !== statusFilter) return false;
-    if (query && !`${m.id} ${(m as Market).title ?? ""}`.toLowerCase().includes(query.toLowerCase())) return false;
+    if (statusFilter !== "all" && m.status !== statusFilter) return false;
+    if (query && !`${m.id} ${m.title ?? ""}`.toLowerCase().includes(query.toLowerCase())) return false;
     return true;
   });
 
@@ -109,12 +140,12 @@ export function Markets() {
       ) : visible.length === 0 ? (
         <EmptyState
           title="No markets found"
-          hint={ids.length === 0 ? "Create a market or import one by ID to get started." : "Try a different filter or search term."}
+          hint={ids.length === 0 ? "No markets on this network yet — create the first one." : "Try a different filter or search term."}
         />
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
           {visible.map((m) => {
-            const row = m as Market & { _missing?: boolean; _rateLimited?: boolean; _error?: string };
+            const row = m;
             if (row._rateLimited) {
               return (
                 <div key={m.id} className="rounded-2xl border border-amber-500/30 bg-amber-500/5 p-5">

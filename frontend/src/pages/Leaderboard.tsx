@@ -1,9 +1,11 @@
 import { Card, EmptyState, ErrorBox, PageHeader, Spinner } from "../components/ui";
-import { getBet, getMarket, getMarketBets, type Bet, type Market } from "../lib/contract";
+import { getMarketBetsDetailed, getMarketsPage, type Bet, type Market } from "../lib/contract";
 import { fmtGen, shorten, sameAddress } from "../lib/format";
 import { useLoader } from "../lib/hooks";
-import { listMarkets } from "../lib/market-registry";
 import { useWallet } from "../lib/wallet";
+
+/** The contract caps a page at 50 — the leaderboard scans that many markets. */
+const LEADERBOARD_MARKETS = 50;
 
 interface BettorStats {
   address: string;
@@ -30,7 +32,13 @@ export function Leaderboard() {
   const { network, address } = useWallet();
 
   const stats = useLoader<BettorStats[]>(async () => {
-    const ids = listMarkets(network);
+    // One call for the market list, then one per decided market for its bets —
+    // instead of getMarket + getMarketBets + a getBet call per bet per market.
+    const markets = (await getMarketsPage(network, 0, LEADERBOARD_MARKETS)).filter(
+      (m) => m.status === "resolved" || m.status === "voided",
+    );
+    const settled = await Promise.allSettled(markets.map((m) => getMarketBetsDetailed(network, m.id)));
+
     const bettorMap = new Map<string, BettorStats>();
 
     function getOrCreate(addr: string): BettorStats {
@@ -43,29 +51,10 @@ export function Leaderboard() {
       return s;
     }
 
-    for (const mid of ids) {
-      let market: Market;
-      try {
-        market = await getMarket(network, mid);
-      } catch {
-        continue;
-      }
-      if (market.status !== "resolved") continue;
-
-      let betIds: string[];
-      try {
-        betIds = await getMarketBets(network, mid);
-      } catch {
-        continue;
-      }
-
-      for (const bid of betIds) {
-        let bet: Bet;
-        try {
-          bet = await getBet(network, bid);
-        } catch {
-          continue;
-        }
+    settled.forEach((res, i) => {
+      if (res.status !== "fulfilled") return;
+      const market: Market = markets[i];
+      for (const bet of res.value as Bet[]) {
         const s = getOrCreate(bet.bettor);
         s.totalBets++;
         s.totalWagered += bet.amount;
@@ -82,7 +71,7 @@ export function Leaderboard() {
           s.profit -= bet.amount;
         }
       }
-    }
+    });
 
     return Array.from(bettorMap.values()).sort((a, b) => (b.profit > a.profit ? 1 : b.profit < a.profit ? -1 : 0));
   }, [network]);

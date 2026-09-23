@@ -80,24 +80,50 @@ export interface PlatformStats {
   owner: string;
 }
 
+const inflight = new Map<string, Promise<unknown>>();
+
+/** JSON key for a read, collapsing unserialisable args to a stable string. */
+function safeArgs(args: unknown[]): string {
+  try {
+    return JSON.stringify(args);
+  } catch {
+    return String(args.length);
+  }
+}
+
 async function view<T>(network: NetworkKey, method: string, args: unknown[] = []): Promise<T> {
   guardRateLimit(); // fail fast while the rate-limit cooldown is active
 
   const cached = viewCacheGet<T>(network, method, args);
   if (cached !== null) return cached;
 
-  const client = getClient(network);
+  // Shared in-flight dedupe: several pages ask for the same market at the same
+  // time, and each duplicate is another request against Studio's 500/hour cap.
+  const key = `${network}|${method}|${safeArgs(args)}`;
+  const pending = inflight.get(key);
+  if (pending) return pending as Promise<T>;
+
+  const run = (async (): Promise<T> => {
+    const client = getClient(network);
+    try {
+      const raw = await client.readContract({
+        address: contractAddress() as `0x${string}`,
+        functionName: method,
+        args: args as never[],
+      });
+      viewCacheSet(network, method, args, raw);
+      return decode<T>(raw);
+    } catch (err) {
+      noteFailurePublic(err); // engages rate-limit cooldown on 429 bursts
+      throw err;
+    }
+  })();
+
+  inflight.set(key, run);
   try {
-    const raw = await client.readContract({
-      address: contractAddress() as `0x${string}`,
-      functionName: method,
-      args: args as never[],
-    });
-    viewCacheSet(network, method, args, raw);
-    return decode<T>(raw);
-  } catch (err) {
-    noteFailurePublic(err); // engages rate-limit cooldown on 429 bursts
-    throw err;
+    return await run;
+  } finally {
+    inflight.delete(key);
   }
 }
 
@@ -165,20 +191,13 @@ export async function getDispute(network: NetworkKey, disputeId: string): Promis
   return normDispute(await view<Record<string, unknown>>(network, "get_dispute", [disputeId]));
 }
 
+/**
+ * Odds are pool math, so callers derive them from a market read they already
+ * have (see MarketDetail) rather than spending an extra `get_odds` round trip.
+ */
 export async function getMarketBets(network: NetworkKey, marketId: string): Promise<string[]> {
   const list = await view<unknown[]>(network, "get_market_bets", [marketId]);
   return (Array.isArray(list) ? list : []).map(toStr);
-}
-
-export async function getOdds(network: NetworkKey, marketId: string): Promise<Odds> {
-  const o = await view<Record<string, unknown>>(network, "get_odds", [marketId]);
-  return {
-    yes: toNumber(o["yes"]),
-    no: toNumber(o["no"]),
-    pool_yes: toBigInt(o["pool_yes"]),
-    pool_no: toBigInt(o["pool_no"]),
-    total_pool: toBigInt(o["total_pool"]),
-  };
 }
 
 export async function getMarketStats(network: NetworkKey, marketId: string): Promise<MarketStats> {
@@ -205,6 +224,33 @@ export async function getPlatformStats(network: NetworkKey): Promise<PlatformSta
     fee_bps: toNumber(s["fee_bps"]),
     owner: toStr(s["owner"]),
   };
+}
+
+// ── Aggregate reads ─────────────────────────────────────────────
+// These exist so a page costs one RPC call instead of N: the old pages looped
+// get_market / get_market_bets / get_bet per market and per bet.
+
+export async function getMarketIds(network: NetworkKey, offset = 0, limit = 50): Promise<string[]> {
+  const list = await view<unknown[]>(network, "get_market_ids", [offset, limit]);
+  return (Array.isArray(list) ? list : []).map(toStr);
+}
+
+/** Newest-first page of full market objects. */
+export async function getMarketsPage(network: NetworkKey, offset = 0, limit = 50): Promise<Market[]> {
+  const list = await view<unknown[]>(network, "get_markets_page", [offset, limit]);
+  return (Array.isArray(list) ? list : []).map((m) => normMarket(m as Record<string, unknown>));
+}
+
+/** Every bet on a market as full objects, newest first. */
+export async function getMarketBetsDetailed(network: NetworkKey, marketId: string): Promise<Bet[]> {
+  const list = await view<unknown[]>(network, "get_market_bets_detailed", [marketId]);
+  return (Array.isArray(list) ? list : []).map((b) => normBet(b as Record<string, unknown>));
+}
+
+/** Every bet placed by one address as full objects, oldest first. */
+export async function getBetsByBettor(network: NetworkKey, bettor: string): Promise<Bet[]> {
+  const list = await view<unknown[]>(network, "get_bets_by_bettor", [bettor]);
+  return (Array.isArray(list) ? list : []).map((b) => normBet(b as Record<string, unknown>));
 }
 
 // ── Writes (all return TxOutcome; reverts surface as ok:false) ──

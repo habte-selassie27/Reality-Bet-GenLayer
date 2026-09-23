@@ -1,28 +1,17 @@
 import { Link } from "react-router-dom";
 import { MarketCard } from "../components/MarketCard";
 import { Card, EmptyState, ErrorBox, PageHeader, Spinner } from "../components/ui";
-import { getMarket, getPlatformStats } from "../lib/contract";
+import { getMarketsPage, getPlatformStats } from "../lib/contract";
 import { fmtGen } from "../lib/format";
 import { useLoader } from "../lib/hooks";
-import { listMarkets } from "../lib/market-registry";
 import { NETWORKS } from "../lib/chains";
 import { useWallet } from "../lib/wallet";
 
 export function Home() {
   const { network } = useWallet();
   const stats = useLoader(() => getPlatformStats(network), [network]);
-  const featured = useLoader(async () => {
-    const ids = listMarkets(network).slice(0, 3);
-    const out = [];
-    for (const id of ids) {
-      try {
-        out.push(await getMarket(network, id));
-      } catch {
-        // skip missing markets
-      }
-    }
-    return out;
-  }, [network]);
+  // One RPC call for the whole strip instead of one per market.
+  const featured = useLoader(() => getMarketsPage(network, 0, 3), [network]);
 
   return (
     <div>
@@ -65,7 +54,7 @@ export function Home() {
         )}
       </div>
 
-      <PageHeader title="Featured markets" sub="Recently tracked markets on this network." action={<Link to="/markets" className="text-sm text-violet-300 hover:underline">View all →</Link>} />
+      <PageHeader title="Featured markets" sub="Newest markets on this network." action={<Link to="/markets" className="text-sm text-violet-300 hover:underline">View all →</Link>} />
       {featured.loading ? (
         <Spinner />
       ) : featured.error ? (
@@ -77,7 +66,7 @@ export function Home() {
           ))}
         </div>
       ) : (
-        <EmptyState title="No markets tracked yet" hint="Create the first market or import one by id." action={<Link to="/create" className="text-sm text-violet-300 hover:underline">Create a market</Link>} />
+        <EmptyState title="No markets yet" hint="Nothing is on chain for this network yet — create the first market." action={<Link to="/create" className="text-sm text-violet-300 hover:underline">Create a market</Link>} />
       )}
 
       <div className="mt-8 grid gap-4 md:grid-cols-3">

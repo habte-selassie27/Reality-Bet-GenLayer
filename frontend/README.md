@@ -17,7 +17,8 @@ Config lives in `.env` (see `.env.example`):
 |---|---|
 | `VITE_CONTRACT_ADDRESS` | Deployed RealityBet contract |
 | `VITE_NETWORK` | `studionet` \| `testnetAsimov` \| `testnetBradbury` \| `localnet` |
-| `VITE_SEED_MARKETS` | Comma-separated market ids shown on first load |
+| `VITE_RPC_URL` | Optional. Absolute RPC endpoint, or `direct` to skip the proxy |
+| `VITE_SEED_MARKETS` | Optional. Extra market ids to pin in this browser's registry |
 
 ## Wallet
 
@@ -25,12 +26,35 @@ Testnet-oriented: **Connect wallet → Import private key** (e.g. exported from 
 or **New burner**. The key stays in `localStorage` in this browser only.
 Fund burner accounts from a funded account (`genlayer account send …`) or a faucet.
 
+## RPC endpoint
+
+Studio's public RPC (`https://studio.genlayer.com/api`) is rate-limited
+(~500 req/hour) and returns 429s **without** an `Access-Control-Allow-Origin`
+header, so the browser reports quota exhaustion as an opaque *“blocked by CORS
+policy”* error. The app avoids both by not calling Studio directly from the
+browser:
+
+- production → the `vercel.json` rewrite proxies `/api/rpc` to Studio
+- dev → the matching proxy in `vite.config.ts`
+
+`VITE_RPC_URL` overrides this with a full URL, or the literal `direct` to
+bypass the proxy.
+
+Reads are batched to stay inside the quota too: the contract enumerates
+everything it owns (`get_market_ids`, `get_markets_page`,
+`get_market_bets_detailed`, `get_bets_by_bettor`), so a page costs one call
+instead of one per market plus one per bet. Successful views are cached for
+60s, identical concurrent reads share one in-flight request, and after a 429
+the app stops sending requests until the cooldown expires (persisted across
+reloads, honoring `Retry-After`).
+
 ## Notes / known contract quirks handled in UI
 
-- The contract has **no on-chain market list** — the app keeps a per-network
-  registry in `localStorage` (seeded from `VITE_SEED_MARKETS`, plus “Import by id”).
-- `get_bettor_bets` currently **traps on-chain**, so **My Bets** enumerates
-  tracked markets (`get_market_bets` → `get_bet` → filter by bettor) instead.
+- Markets are enumerated on chain (`get_markets_page`). `localStorage`
+  (`realitybet.markets.v3.<network>`) is now only a small per-browser pin list
+  for ids added via “Import by id”, plus the optional `VITE_SEED_MARKETS`.
+- Bets are enumerated on chain per wallet (`get_bets_by_bettor`), so **My Bets**
+  works in any browser for the connected wallet.
 - The GenLayer CLI cannot attach GEN to payable calls, but this UI can —
   betting/funding go through `genlayer-js writeContract({ value })`.
 - Writes wait for `FINALIZED` consensus (can take minutes for AI resolution);

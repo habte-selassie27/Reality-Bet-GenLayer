@@ -1,17 +1,23 @@
 import { createClient } from "genlayer-js";
 import { TransactionStatus } from "genlayer-js/types";
 import type { Hash } from "genlayer-js/types";
-import { CONTRACT_ADDRESS, NETWORKS, type NetworkKey } from "./chains";
+import { CONTRACT_ADDRESS, NETWORKS, rpcUrl, type NetworkKey } from "./chains";
 
 type Client = ReturnType<typeof createClient>;
 
 const clients = new Map<string, Client>();
 
+/** Spreadable config fragment selecting the RPC endpoint (omitted when direct). */
+function rpcConfig(): { endpoint?: string } {
+  const endpoint = rpcUrl();
+  return endpoint ? { endpoint } : {};
+}
+
 /** Cached read-only client per network (no account needed for views). */
 export function getClient(network: NetworkKey): Client {
   const hit = clients.get(network);
   if (hit) return hit;
-  const c = createClient({ chain: NETWORKS[network].chain });
+  const c = createClient({ chain: NETWORKS[network].chain, ...rpcConfig() });
   clients.set(network, c);
   return c;
 }
@@ -45,7 +51,9 @@ export async function ensureChain(eth: any, network: NetworkKey): Promise<void> 
         params: [{
           chainId: targetId,
           chainName: cfg.chain.name,
-          rpcUrls: [cfg.chain.rpcUrls.default.http[0]],
+          // Point the wallet at the same endpoint the app reads from when we
+          // have a proxy — it forwards the same JSON-RPC API.
+          rpcUrls: [rpcUrl() ?? cfg.chain.rpcUrls.default.http[0]],
           // Required by EIP-3085 — a wallet may refuse to add the chain without it.
           nativeCurrency: cfg.chain.nativeCurrency,
           blockExplorerUrls: cfg.explorer ? [cfg.explorer] : [],
@@ -106,8 +114,19 @@ function isNetworkError(msg: string): boolean {
 const RATE_LIMIT_COOLDOWN_MS = 10 * 60_000; // pause all RPC for 10 min
 const NET_FAIL_WINDOW_MS = 30_000;          // burst window
 const NET_FAIL_THRESHOLD = 3;               // failures within window → rate-limited
+const RATE_LIMIT_KEY = "realitybet.ratelimit.v1";
 
-let rateLimitedUntil = 0;
+/** Survive reloads: module state alone let a page refresh re-hammer the RPC. */
+function readStoredCooldown(): number {
+  try {
+    const v = Number(localStorage.getItem(RATE_LIMIT_KEY) ?? 0);
+    return Number.isFinite(v) && v > Date.now() ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+let rateLimitedUntil = readStoredCooldown();
 let netFailStamps: number[] = [];
 
 function rateLimitError(): Error {
@@ -122,9 +141,22 @@ export function guardRateLimit(): void {
   if (Date.now() < rateLimitedUntil) throw rateLimitError();
 }
 
-function engageRateLimit(): void {
-  rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+function engageRateLimit(ms = RATE_LIMIT_COOLDOWN_MS): void {
+  rateLimitedUntil = Date.now() + ms;
   netFailStamps = [];
+  try {
+    localStorage.setItem(RATE_LIMIT_KEY, String(rateLimitedUntil));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** Studio sends Retry-After on 429s — prefer it over the default cooldown. */
+function retryAfterMs(msg: string): number | null {
+  const m = msg.match(/retry-after["'\s:=]+(\d+)/i);
+  if (!m) return null;
+  const secs = Number(m[1]);
+  return Number.isFinite(secs) && secs > 0 ? secs * 1000 : null;
 }
 
 /** Classify a read/write failure; engages the cooldown when rate-limited. */
@@ -132,7 +164,7 @@ function noteFailure(err: unknown): "rate_limit" | "user_reject" | "network" | "
   const msg = err instanceof Error ? err.message : String(err);
   if (/4001|user rejected|denied/i.test(msg)) return "user_reject";
   if (/429|Too Many Requests|Rate limit/i.test(msg)) {
-    engageRateLimit();
+    engageRateLimit(retryAfterMs(msg) ?? RATE_LIMIT_COOLDOWN_MS);
     return "rate_limit";
   }
   if (!isNetworkError(msg)) {
@@ -155,11 +187,11 @@ export function noteFailurePublic(err: unknown): void {
   noteFailure(err);
 }
 
-// ── View cache (30s TTL) ────────────────────────────────────────────
+// ── View cache (60s TTL) ────────────────────────────────────────────
 // Cross-navigation dedupe: re-entering a page reuses recent reads
 // instead of re-hitting the RPC. Cleared after every successful write.
 
-const VIEW_TTL_MS = 30_000;
+const VIEW_TTL_MS = 60_000;
 const viewCache = new Map<string, { t: number; v: unknown }>();
 
 export function viewCacheGet<T>(network: NetworkKey, method: string, args: unknown[]): T | null {
@@ -338,6 +370,7 @@ async function sendWriteOnce<T>(opts: {
     chain: NETWORKS[opts.network].chain,
     account: opts.address as `0x${string}`,
     provider: opts.provider,
+    ...rpcConfig(),
   });
 
   const hash = (await client.writeContract({

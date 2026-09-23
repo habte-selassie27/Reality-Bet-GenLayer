@@ -1,5 +1,16 @@
 import { SEED_MARKETS, type NetworkKey } from "./chains";
 
+/**
+ * Pinned market ids for the current browser.
+ *
+ * This is NOT the source of truth any more: the contract exposes
+ * get_market_ids / get_markets_page, so Market lists, My Bets and the
+ * Leaderboard read every market on chain. What remains here is a small
+ * per-browser list of ids worth keeping visible anyway — markets created
+ * locally before those views shipped, and ids pasted in via "Import by ID" —
+ * plus the optional VITE_SEED_MARKETS list baked in at build time.
+ */
+
 /** Bump this to force-clear stale localStorage data from old deployments. */
 const STORAGE_VERSION = 3;
 const KEY = `realitybet.markets.v${STORAGE_VERSION}`;

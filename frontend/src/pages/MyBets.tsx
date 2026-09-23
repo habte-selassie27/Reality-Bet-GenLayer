@@ -1,9 +1,15 @@
 import { Link } from "react-router-dom";
 import { Btn, Card, EmptyState, ErrorBox, PageHeader, Spinner } from "../components/ui";
-import { claimWinnings, getBet, getMarket, getMarketBets, refundVoid, type Bet } from "../lib/contract";
-import { fmtDateTime, fmtGen, sameAddress } from "../lib/format";
+import {
+  claimWinnings,
+  getBetsByBettor,
+  getMarket,
+  refundVoid,
+  type Bet,
+  type Market,
+} from "../lib/contract";
+import { fmtDateTime, fmtGen } from "../lib/format";
 import { useLoader } from "../lib/hooks";
-import { listMarkets } from "../lib/market-registry";
 import { useWallet } from "../lib/wallet";
 import { useState } from "react";
 
@@ -14,8 +20,9 @@ interface Row extends Bet {
 }
 
 /**
- * NB: the on-chain get_bettor_bets view currently traps, so My Bets
- * enumerates known markets instead (market_bets → get_bet → filter).
+ * Bets come straight from the contract's per-bettor index
+ * (get_bets_by_bettor), so this page works in any browser — it no longer
+ * depends on the visitor's local market registry.
  */
 export function MyBets() {
   const { network, address, provider } = useWallet();
@@ -24,38 +31,32 @@ export function MyBets() {
 
   const bets = useLoader<Row[]>(async () => {
     if (!address) return [];
-    const ids = listMarkets(network);
-    const rows: Row[] = [];
-    for (const mid of ids) {
-      let betIds: string[] = [];
-      try {
-        betIds = await getMarketBets(network, mid);
-      } catch {
-        continue;
-      }
-      let title = mid;
-      let status = "";
-      let outcome = "";
-      try {
-        const mk = await getMarket(network, mid);
-        title = mk.title;
-        status = mk.status;
-        outcome = mk.outcome;
-      } catch {
-        // keep defaults
-      }
-      for (const bid of betIds) {
+
+    // One call for every bet this wallet placed, then one cached read per
+    // distinct market for its title and status.
+    const mine = await getBetsByBettor(network, address);
+    const markets = new Map<string, Market>();
+    await Promise.all(
+      Array.from(new Set(mine.map((b) => b.market_id))).map(async (mid) => {
         try {
-          const b = await getBet(network, bid);
-          if (sameAddress(b.bettor, address)) {
-            rows.push({ ...b, marketTitle: title, marketStatus: status, marketOutcome: outcome });
-          }
+          markets.set(mid, await getMarket(network, mid));
         } catch {
-          // skip
+          // market unreadable — fall back to showing the raw id
         }
-      }
-    }
-    return rows.sort((a, b) => b.placed_at - a.placed_at);
+      }),
+    );
+
+    return mine
+      .map((b) => {
+        const mk = markets.get(b.market_id);
+        return {
+          ...b,
+          marketTitle: mk?.title ?? b.market_id,
+          marketStatus: mk?.status ?? "",
+          marketOutcome: mk?.outcome ?? "",
+        };
+      })
+      .sort((a, b) => b.placed_at - a.placed_at);
   }, [network, address]);
 
   async function act(betId: string, kind: "claim" | "refund") {
@@ -80,11 +81,11 @@ export function MyBets() {
 
   return (
     <div>
-      <PageHeader title="My bets" sub="Bets placed by the connected wallet across tracked markets." />
+      <PageHeader title="My bets" sub="Bets placed by the connected wallet on this network." />
       {!address ? (
         <EmptyState title="No wallet connected" hint="Connect a wallet to see your bets." />
       ) : bets.loading ? (
-        <Spinner label="Scanning markets for your bets…" />
+        <Spinner label="Loading your bets…" />
       ) : bets.error ? (
         <ErrorBox message={bets.error} onRetry={bets.reload} />
       ) : !bets.data || bets.data.length === 0 ? (

@@ -2,13 +2,27 @@
 
 **Live demo:** [https://reality-bet.vercel.app](https://reality-bet.vercel.app)
 
+![RealityBet hero](docs/images/hero-logo.jpeg)
+
 Decentralized YES/NO prediction market where GenLayer validator consensus settles real-world events using live web data. Anyone can create a market; bettors stake GEN in parimutuel pools; an AI resolver fetches the primary source and judges the outcome; validators independently re-verify; winners claim payouts.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Markets](docs/images/screenshot-01-18-52.png) | ![Market detail](docs/images/screenshot-01-20-51.png) |
+| ![Place bet](docs/images/screenshot-01-20-57.png) | ![Odds](docs/images/screenshot-01-21-05.png) |
+| ![My bets](docs/images/screenshot-01-21-14.png) | ![Resolution](docs/images/screenshot-01-21-34.png) |
+| ![Dispute](docs/images/screenshot-01-21-39.png) | ![Wallet](docs/images/screenshot-01-21-47.png) |
+| ![Stats](docs/images/screenshot-01-21-53.png) | ![Admin](docs/images/screenshot-01-22-13.png) |
+| ![Extra view](docs/images/screenshot-01-22-22.png) | |
 
 ---
 
 ## Table of contents
 
 - [How GenLayer consensus is used](#how-genlayer-consensus-is-used)
+- [Screenshots](#screenshots)
 - [Market lifecycle](#market-lifecycle)
 - [Payout formula](#payout-formula)
 - [Contract API](#contract-api)
@@ -197,6 +211,8 @@ Reality-Bet-Genlayer/
 ├── SUBMISSION.md              # portal copy-paste notes
 ├── AGENTS.md                  # architecture & agent-role design doc
 ├── genlayer_skills.md         # GenLayer build / lint / test / deploy checklist
+├── docs/
+│   └── images/                # hero + UI screenshots
 ├── contracts/
 │   └── RealityBet.py          # single Intelligent Contract (~570 lines)
 ├── tests/

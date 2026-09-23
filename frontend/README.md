@@ -2,6 +2,19 @@
 
 React + Vite + Tailwind + `genlayer-js` UI for the RealityBet Intelligent Contract.
 
+![RealityBet hero](../docs/images/hero-logo.jpeg)
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Markets](../docs/images/screenshot-01-18-52.png) | ![Market detail](../docs/images/screenshot-01-20-51.png) |
+| ![Place bet](../docs/images/screenshot-01-20-57.png) | ![Odds](../docs/images/screenshot-01-21-05.png) |
+| ![My bets](../docs/images/screenshot-01-21-14.png) | ![Resolution](../docs/images/screenshot-01-21-34.png) |
+| ![Dispute](../docs/images/screenshot-01-21-39.png) | ![Wallet](../docs/images/screenshot-01-21-47.png) |
+| ![Stats](../docs/images/screenshot-01-21-53.png) | ![Admin](../docs/images/screenshot-01-22-13.png) |
+| ![Extra view](../docs/images/screenshot-01-22-22.png) | |
+
 ## Run
 
 ```bash

@@ -19,11 +19,11 @@ function toUnix(dtLocal: string): number | null {
 }
 
 function defaultClose(): string {
-  const d = new Date(Date.now() + 14 * 60 * 1000);
+  const d = new Date(Date.now() + 10 * 60 * 1000);
   return toLocal(d);
 }
 function defaultResolve(): string {
-  const d = new Date(Date.now() + 16 * 60 * 1000);
+  const d = new Date(Date.now() + 10 * 60 * 1000);
   return toLocal(d);
 }
 function toLocal(d: Date): string {

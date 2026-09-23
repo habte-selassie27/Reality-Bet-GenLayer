@@ -1,5 +1,7 @@
 # RealityBet — AI-Resolved Prediction Market on GenLayer
 
+**Live demo:** [https://reality-bet.vercel.app](https://reality-bet.vercel.app)
+
 Decentralized prediction market where GenLayer validator consensus settles real-world events using live web data. Anyone creates a YES/NO market; bettors fund pools in GEN; AI resolves; winners claim parimutuel payouts.
 
 ## How GenLayer consensus is used

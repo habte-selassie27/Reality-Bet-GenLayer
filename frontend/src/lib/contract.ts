@@ -31,6 +31,12 @@ export interface Market {
   resolver_note: string;
   resolver_confidence: string;
   resolver_sources: string;
+  /** Outcome frozen: it can no longer be changed by a dispute. */
+  finalized: boolean;
+  /** Payouts unlocked — false while the dispute window is still open. */
+  claims_open: boolean;
+  /** Unix ts the 24h dispute window closes (0 if unresolved). */
+  dispute_deadline: number;
 }
 
 export interface Bet {
@@ -151,6 +157,9 @@ function normMarket(m: Record<string, unknown>): Market {
     resolver_note: toStr(m["resolver_note"]),
     resolver_confidence: toStr(m["resolver_confidence"]),
     resolver_sources: toStr(m["resolver_sources"]),
+    finalized: toBool(m["finalized"]),
+    claims_open: toBool(m["claims_open"]),
+    dispute_deadline: toNumber(m["dispute_deadline"]),
   };
 }
 
@@ -278,6 +287,10 @@ export const lockMarket = (network: NetworkKey, address: string, provider: any, 
 
 export const voidMarket = (network: NetworkKey, address: string, provider: any, marketId: string) =>
   write<boolean>(network, address, provider, "void_market", [marketId]);
+
+/** Freeze a resolved outcome once its dispute window has closed (permissionless). */
+export const finalizeMarket = (network: NetworkKey, address: string, provider: any, marketId: string) =>
+  write<boolean>(network, address, provider, "finalize_market", [marketId]);
 
 export const fundMarket = (network: NetworkKey, address: string, provider: any, marketId: string, valueWei: bigint) =>
   write<boolean>(network, address, provider, "fund_market", [marketId], valueWei);

@@ -23,6 +23,26 @@ def _setup_open_market(direct_vm, contract):
     return _make_market(contract, now + 1000, now + 2000)
 
 
+# Every test below resolves its market at 01:00, which is when the 24h dispute
+# window opens. Payouts stay locked until that window closes, so claims must
+# warp past it first.
+_RESOLVED_AT = "2025-01-01T01:00:00Z"
+_DISPUTE_WINDOW = 86400
+
+
+def _past_dispute_window(direct_vm):
+    direct_vm.warp("2025-01-02T01:00:01Z")
+
+
+def _hex(addr):
+    """Address fixtures vary by genlayer-test version (bytes, str, Address),
+    while the contract's string views expect 0x-hex. Normalise either form."""
+    if isinstance(addr, (bytes, bytearray)):
+        return "0x" + bytes(addr).hex()
+    s = str(addr)
+    return s if s.startswith("0x") else "0x" + s
+
+
 def _mock_resolution(direct_vm, outcome, confidence="high"):
     direct_vm.mock_web(".*", {"status": 200, "body": "<html>BTC price $105000</html>"})
     direct_vm.mock_llm(".*", json.dumps({
@@ -134,10 +154,13 @@ def test_resolve_yes_pays_winner(direct_vm, direct_deploy, direct_owner, direct_
     assert m["outcome"] == "yes"
     assert m["resolver_confidence"] == "high"
     assert "coinmarketcap.com" in m["resolver_sources"]
+    _past_dispute_window(direct_vm)
     direct_vm.sender = direct_alice
     payout = int(contract.claim_winnings(bid_yes))
     # gross=(6000*10000)//6000=10000, fee=10000*150//10000=150, net=9850
     assert payout == 9850
+    # Paying out after the window freezes the market without a finalize call.
+    assert contract.get_market(mid)["finalized"] is True
 
 
 def test_resolve_no_pays_winner(direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob):
@@ -157,6 +180,7 @@ def test_resolve_no_pays_winner(direct_vm, direct_deploy, direct_owner, direct_a
     direct_vm.warp("2025-01-01T01:00:00Z")
     _mock_resolution(direct_vm, "no")
     contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
     direct_vm.sender = direct_bob
     payout = int(contract.claim_winnings(bid_no))
     # gross=(8000*10000)//8000=10000, fee=150, net=9850
@@ -177,6 +201,7 @@ def test_resolve_void_refunds(direct_vm, direct_deploy, direct_owner, direct_ali
     _mock_resolution(direct_vm, "void")
     contract.request_resolution(mid)
     assert contract.get_market(mid)["outcome"] == "void"
+    _past_dispute_window(direct_vm)
     direct_vm.sender = direct_alice
     assert int(contract.claim_winnings(bid)) == 5000
 
@@ -198,6 +223,7 @@ def test_low_confidence_voids(direct_vm, direct_deploy, direct_owner, direct_ali
     assert m["outcome"] == "void"
     assert "Low confidence" in m["resolver_note"]
     assert m["resolver_confidence"] == "low"
+    _past_dispute_window(direct_vm)
     direct_vm.sender = direct_alice
     assert int(contract.claim_winnings(bid)) == 1000
 
@@ -215,6 +241,7 @@ def test_duplicate_claim_reverts(direct_vm, direct_deploy, direct_owner, direct_
     direct_vm.warp("2025-01-01T01:00:00Z")
     _mock_resolution(direct_vm, "yes")
     contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
     direct_vm.sender = direct_alice
     contract.claim_winnings(bid)
     with direct_vm.expect_revert("Already claimed"):
@@ -262,6 +289,7 @@ def test_loser_gets_zero(direct_vm, direct_deploy, direct_owner, direct_alice, d
     direct_vm.warp("2025-01-01T01:00:00Z")
     _mock_resolution(direct_vm, "yes")
     contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
     direct_vm.sender = direct_bob
     assert int(contract.claim_winnings(bid_no)) == 0
 
@@ -285,6 +313,7 @@ def test_fee_split(direct_vm, direct_deploy, direct_owner, direct_alice, direct_
     _mock_resolution(direct_vm, "yes")
     contract.request_resolution(mid)
     assert contract.get_market(mid)["fee_bps"] == 200
+    _past_dispute_window(direct_vm)
     direct_vm.sender = direct_alice
     payout = int(contract.claim_winnings(bid_yes))
     # gross=(3000*4000)//3000=4000, fee=4000*200//10000=80, net=3920
@@ -351,7 +380,7 @@ def test_bets_by_bettor_matches_raw_and_hex(direct_vm, direct_deploy, direct_own
     bid_no = contract.place_bet(mid, "no")
     direct_vm.value = 0
 
-    alice_bets = contract.get_bets_by_bettor(direct_alice)
+    alice_bets = contract.get_bets_by_bettor(_hex(direct_alice))
     assert len(alice_bets) == 1
     assert alice_bets[0]["id"] == bid_yes
     assert alice_bets[0]["side"] == "yes"
@@ -365,5 +394,345 @@ def test_bets_by_bettor_matches_raw_and_hex(direct_vm, direct_deploy, direct_own
     assert contract.get_bettor_bets(bare) == [bid_yes]
     assert [b["id"] for b in contract.get_bets_by_bettor(bare)] == [bid_yes]
 
-    assert [b["id"] for b in contract.get_bets_by_bettor(direct_bob)] == [bid_no]
+    assert [b["id"] for b in contract.get_bets_by_bettor(_hex(direct_bob))] == [bid_no]
     assert contract.get_bets_by_bettor("0xdeadbeef") == []
+
+
+def test_claims_locked_until_dispute_window_closes(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """Resolve → early claim blocked → disputed outcome change → solvent payout.
+
+    This is the full payout-safety path: no money may move while the outcome is
+    still appealable, a dispute may still flip the outcome, and the payout that
+    follows follows the *final* outcome and is frozen from then on.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 6000
+    bid_yes = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_bob
+    direct_vm.value = 4000
+    bid_no = contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    assert contract.request_resolution(mid) is True
+
+    m = contract.get_market(mid)
+    assert m["status"] == "resolved" and m["outcome"] == "yes"
+    assert m["finalized"] is False
+    assert m["claims_open"] is False
+    assert m["dispute_deadline"] == _ts(_RESOLVED_AT) + _DISPUTE_WINDOW
+
+    # 1. Early claim is rejected — resolved is not the same as final.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("payouts locked"):
+        contract.claim_winnings(bid_yes)
+    assert contract.get_bet(bid_yes)["claimed"] is False
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Dispute window still open"):
+        contract.finalize_market(mid)
+
+    # 2. The losing side disputes inside the window and the outcome flips.
+    direct_vm.sender = direct_bob
+    did = contract.raise_dispute(mid, "Source misread: the event did not occur")
+    assert contract.get_market(mid)["status"] == "disputed"
+    with direct_vm.expect_revert("Market not resolved"):
+        contract.claim_winnings(bid_no)
+
+    direct_vm.sender = direct_owner
+    assert contract.resolve_dispute(did, True, "no", "Manual review flipped it") is True
+    m = contract.get_market(mid)
+    assert m["status"] == "resolved" and m["outcome"] == "no"
+    assert m["finalized"] is True   # dispute finally resolved → payouts open now
+    assert m["claims_open"] is True
+
+    # 3. Payouts follow the final outcome and stay solvent: the 4000 NO stake
+    #    takes the 10000 pool minus the 1.5% fee, and the YES stake wins nothing.
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid_yes)) == 0
+    direct_vm.sender = direct_bob
+    payout_no = int(contract.claim_winnings(bid_no))
+    assert payout_no == 9850  # gross 4000*10000//4000 = 10000, fee 150
+    assert payout_no <= 6000 + 4000
+    assert 6000 + 4000 - payout_no == 150
+
+    # 4. Funds moved, so the outcome is sealed: no second claim, no force
+    #    resolve, no re-resolution, no fresh dispute.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Already claimed"):
+        contract.claim_winnings(bid_yes)
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Invalid state"):
+        contract.force_resolve(mid, "yes", "flip after payout")
+    with direct_vm.expect_revert("Market not disputed"):
+        contract.re_resolve(mid)
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("outcome locked"):
+        contract.raise_dispute(mid, "second bite")
+    assert contract.get_market(mid)["outcome"] == "no"
+
+
+def test_finalize_unlocks_payouts_after_window(direct_vm, direct_deploy, direct_owner, direct_alice):
+    """An undisputed market: locked through the window, then finalize (or a
+    later claim) freezes it and the fee split still lands."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+
+    with direct_vm.expect_revert("payouts locked"):
+        contract.claim_winnings(bid)
+    _past_dispute_window(direct_vm)
+    assert contract.finalize_market(mid) is True
+    assert contract.get_market(mid)["finalized"] is True
+    assert int(contract.claim_winnings(bid)) == 985  # gross 1000, fee 15
+    with direct_vm.expect_revert("Market already finalized"):
+        contract.finalize_market(mid)
+    # A claim made after the window freezes the market too, so a late dispute
+    # cannot reopen it.
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("outcome locked"):
+        contract.raise_dispute(mid, "too late")
+
+
+def test_ai_void_refunds_locked_until_window(direct_vm, direct_deploy, direct_owner, direct_alice):
+    """A void *resolution* is still a resolution: refunds wait for the window,
+    then return the whole stake (no fee) instead of paying a winner."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 5000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "void")
+    contract.request_resolution(mid)
+
+    m = contract.get_market(mid)
+    assert m["status"] == "resolved" and m["outcome"] == "void"
+    assert m["claims_open"] is False
+    with direct_vm.expect_revert("payouts locked"):
+        contract.claim_winnings(bid)
+
+    _past_dispute_window(direct_vm)
+    assert contract.get_market(mid)["claims_open"] is True
+    assert int(contract.claim_winnings(bid)) == 5000
+    assert contract.get_bet(bid)["claimed"] is True
+
+
+def test_creator_void_refunds_immediately(direct_vm, direct_deploy, direct_owner, direct_alice):
+    """Deliberate exemption: void_market is terminal — no outcome can ever be
+    set on that market — so there is nothing to dispute and refunds are open."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 2000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+
+    direct_vm.sender = direct_owner
+    assert contract.void_market(mid) is True
+    assert contract.get_market(mid)["claims_open"] is True
+    direct_vm.sender = direct_alice
+    assert contract.refund_void(bid) is True
+    assert contract.get_bet(bid)["claimed"] is True
+    # Still no way to move money a second time on a voided market.
+    with direct_vm.expect_revert("Already claimed"):
+        contract.refund_void(bid)
+
+
+def test_rejected_dispute_unlocks_payouts_immediately(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """The other half of the payout gate: a *finally resolved* dispute opens
+    claims straight away, without waiting out a second 24h window."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 6000
+    bid_yes = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_bob
+    direct_vm.value = 4000
+    contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+
+    direct_vm.sender = direct_bob
+    did = contract.raise_dispute(mid, "I disagree with the source")
+    direct_vm.sender = direct_owner
+    assert contract.resolve_dispute(did, False, "", "No basis for the dispute") is True
+    m = contract.get_market(mid)
+    assert m["outcome"] == "yes"
+    assert m["finalized"] is True
+    assert m["claims_open"] is True          # same second as the ruling
+
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid_yes)) == 9850
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("outcome locked"):
+        contract.raise_dispute(mid, "second bite")
+
+
+def test_force_resolve_dangling_dispute_cannot_land_after_payout(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """force_resolve leaves the ruling dispute unresolved behind it. That stale
+    dispute must never be enforceable — least of all after money moved — and
+    the forced outcome gets a fresh window of its own."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 6000
+    contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_bob
+    direct_vm.value = 4000
+    bid_no = contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+
+    direct_vm.sender = direct_alice
+    did = contract.raise_dispute(mid, "Primary source misread")
+    direct_vm.sender = direct_owner
+    assert contract.force_resolve(mid, "no", "Manual override") is True
+
+    # Market is resolved again, so the stale dispute can no longer be ruled on.
+    with direct_vm.expect_revert("Dispute no longer active"):
+        contract.resolve_dispute(did, True, "yes", "land it after the force")
+
+    # The forced outcome restarts the window: payouts stay locked inside it.
+    direct_vm.sender = direct_bob
+    assert contract.get_market(mid)["claims_open"] is False
+    with direct_vm.expect_revert("payouts locked"):
+        contract.claim_winnings(bid_no)
+
+    _past_dispute_window(direct_vm)
+    assert int(contract.claim_winnings(bid_no)) == 9850
+
+    # Funds moved: every remaining outcome path is shut, stale dispute included.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("outcome locked"):
+        contract.raise_dispute(mid, "again")
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Market finalized"):
+        contract.resolve_dispute(did, True, "yes", "flip after payout")
+    assert contract.get_market(mid)["outcome"] == "no"
+
+
+def test_re_resolve_gives_fresh_window_and_kills_stale_dispute(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """re_resolve re-decides the outcome, so it must re-lock payouts for a full
+    window, and the dispute that triggered it must not be resolvable later."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 6000
+    contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_bob
+    direct_vm.value = 4000
+    bid_no = contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+
+    direct_vm.sender = direct_bob
+    did = contract.raise_dispute(mid, "Re-run the AI")
+    direct_vm.sender = direct_owner
+    assert contract.re_resolve(mid) is True
+    m = contract.get_market(mid)
+    assert m["status"] == "resolved"
+    assert m["claims_open"] is False              # fresh window after the re-run
+    assert m["finalized"] is False
+
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("payouts locked"):
+        contract.claim_winnings(bid_no)
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Dispute no longer active"):
+        contract.resolve_dispute(did, True, "yes", "stale ruling")
+
+    _past_dispute_window(direct_vm)
+    direct_vm.sender = direct_bob
+    contract.claim_winnings(bid_no)               # exactly once
+    with direct_vm.expect_revert("Already claimed"):
+        contract.claim_winnings(bid_no)
+    assert contract.get_market(mid)["finalized"] is True
+
+
+def test_only_one_dispute_can_ever_land_an_outcome(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """Two disputes can exist across a force_resolve, but only one ruling may
+    take effect — otherwise the same pool could be paid out on both sides."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 6000
+    bid_yes = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_bob
+    direct_vm.value = 4000
+    bid_no = contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+
+    direct_vm.sender = direct_bob
+    did_1 = contract.raise_dispute(mid, "First challenge")
+    direct_vm.sender = direct_owner
+    contract.force_resolve(mid, "no", "Manual override")
+    direct_vm.sender = direct_alice
+    did_2 = contract.raise_dispute(mid, "Second challenge")
+
+    direct_vm.sender = direct_owner
+    assert contract.resolve_dispute(did_1, True, "yes", "First ruling lands") is True
+    with direct_vm.expect_revert("Market finalized"):
+        contract.resolve_dispute(did_2, True, "no", "Second ruling must not")
+    assert contract.get_market(mid)["outcome"] == "yes"
+
+    # One pool, one winner set: 9850 out of the 10000 staked, loser gets 0.
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid_yes)) == 9850
+    direct_vm.sender = direct_bob
+    assert int(contract.claim_winnings(bid_no)) == 0
+    assert 9850 + 0 <= 6000 + 4000

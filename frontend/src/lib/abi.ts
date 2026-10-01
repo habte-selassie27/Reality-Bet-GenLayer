@@ -22,6 +22,13 @@ export const REALITY_BET_ABI = [
   },
   {
     type: "function",
+    name: "finalize_market",
+    inputs: [{ name: "market_id", type: "string" }],
+    outputs: [{ name: "", type: "bool" }],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
     name: "void_market",
     inputs: [{ name: "market_id", type: "string" }],
     outputs: [{ name: "", type: "bool" }],
@@ -146,6 +153,9 @@ export const REALITY_BET_ABI = [
           { name: "resolver_note", type: "string" },
           { name: "resolver_confidence", type: "string" },
           { name: "resolver_sources", type: "string" },
+          { name: "finalized", type: "bool" },
+          { name: "claims_open", type: "bool" },
+          { name: "dispute_deadline", type: "uint256" },
         ],
       },
     ],

@@ -5,12 +5,19 @@ from datetime import datetime, timezone
 import json
 import typing
 
+# Payouts stay locked until the outcome can no longer change: either the
+# dispute window elapses, or a raised dispute is finally resolved. Only a
+# finalized market may pay out, so funds can never be claimed against an
+# outcome that is still appealable.
+DISPUTE_WINDOW = 86400
+
+
 class MarketStatus:
     OPEN = "open"
     LOCKED = "locked"
-    RESOLVED = "resolved"
-    VOIDED = "voided"
-    DISPUTED = "disputed"
+    RESOLVED = "resolved"       # outcome decided, payouts locked (dispute window)
+    VOIDED = "voided"           # cancelled by creator/owner, terminal, refunds open
+    DISPUTED = "disputed"       # outcome under appeal, all payouts stopped
 
 
 class Outcome:
@@ -45,6 +52,10 @@ class Market:
     resolver_note: str
     resolver_confidence: str
     resolver_sources: str
+    # Appended last: True once the outcome is frozen (dispute window elapsed or
+    # a dispute was finally resolved). An outcome can never change after this,
+    # which is what makes claims safe to pay out.
+    finalized: bool
 
 
 @allow_storage
@@ -99,6 +110,28 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Market not found")
         return self.markets[mid]
 
+    def _window_closed(self, m: Market) -> bool:
+        """True once the market's dispute window has fully elapsed."""
+        return int(m.resolved_at) > 0 and int(self._now()) >= int(m.resolved_at) + DISPUTE_WINDOW
+
+    def _claims_open(self, m: Market) -> bool:
+        """Payouts unlock only once the outcome is frozen.
+
+        A VOIDED market is terminal (there is no outcome left to re-decide), so
+        refunds open immediately. A RESOLVED market unlocks when its dispute
+        window has closed or a raised dispute was finally resolved — both set
+        `finalized`, and no outcome-changing method accepts a finalized market.
+        """
+        if m.status == MarketStatus.VOIDED:
+            return True
+        if m.status == MarketStatus.RESOLVED:
+            if m.finalized:
+                return True
+            if self._window_closed(m):
+                m.finalized = True  # lazily freeze on the first payout after the window
+                return True
+        return False
+
     def _get_bet(self, bid: str) -> Bet:
         if bid not in self.bets:
             raise gl.vm.UserError("Bet not found")
@@ -133,6 +166,7 @@ class RealityBet(gl.Contract):
             mid, gl.message.sender_address, title, description, resolution_url,
             cats, close_time, resolve_time, "", MarketStatus.OPEN,
             u256(0), u256(0), self.platform_fee_bps, u256(0), "", "", "",
+            False,
         )
         self.market_bets.get_or_insert_default(mid)
         return mid
@@ -145,6 +179,26 @@ class RealityBet(gl.Contract):
         if not m.status == MarketStatus.OPEN:
             raise gl.vm.UserError("Market not open")
         m.status = MarketStatus.LOCKED
+        self.markets[market_id] = m
+        return True
+
+    @gl.public.write
+    def finalize_market(self, market_id: str) -> bool:
+        """Freeze a resolved outcome once its dispute window has closed.
+
+        Anyone may call this. It is the explicit way to unlock payouts for a
+        market whose outcome was never disputed; claiming after the window also
+        freezes the market lazily. Either way the outcome is immutable from
+        then on. Voided markets are already terminal and need no finalization.
+        """
+        m = self._get_market(market_id)
+        if m.finalized:
+            raise gl.vm.UserError("Market already finalized")
+        if m.status != MarketStatus.RESOLVED:
+            raise gl.vm.UserError("Market not resolved")
+        if not self._window_closed(m):
+            raise gl.vm.UserError("Dispute window still open")
+        m.finalized = True
         self.markets[market_id] = m
         return True
 
@@ -214,6 +268,11 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Already claimed")
         if not m.status == MarketStatus.RESOLVED:
             raise gl.vm.UserError("Market not resolved")
+        if not self._claims_open(m):
+            raise gl.vm.UserError("Dispute window open - payouts locked")
+        # Persist the lazy finalization _claims_open may have just set, so the
+        # outcome is frozen from the first payout onwards.
+        self.markets[b.market_id] = m
         payout = u256(0)
         if m.outcome == Outcome.VOID:
             payout = b.amount
@@ -244,6 +303,9 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Already claimed")
         if not m.status == MarketStatus.VOIDED:
             raise gl.vm.UserError("Market not voided")
+        # No dispute gate here by design: VOIDED is only reachable through
+        # void_market, is terminal, and no method can set an outcome on it — so
+        # the refund can never be paid against an outcome that later flips.
         b.claimed = True
         self.bets[bet_id] = b
         gl.get_contract_at(b.bettor).emit_transfer(value=b.amount)
@@ -316,9 +378,15 @@ class RealityBet(gl.Contract):
                 outcome = "void"
                 reason = "AI parse error voided"
         except Exception:
-            m.status = MarketStatus.VOIDED
+            # A parse failure is a VOID outcome, not a terminal cancellation:
+            # it lands in RESOLVED so bettors still get a dispute window and the
+            # window must close before refunds are paid.
+            m.outcome = Outcome.VOID
+            m.status = MarketStatus.RESOLVED
+            m.resolved_at = self._now()
             m.resolver_note = "AI parse error voided"
             m.resolver_confidence = "low"
+            m.finalized = False
             self.markets[market_id] = m
             return
         m.outcome = outcome
@@ -327,6 +395,7 @@ class RealityBet(gl.Contract):
         m.resolver_note = reason
         m.resolver_confidence = conf
         m.resolver_sources = sources
+        m.finalized = False
         self.markets[market_id] = m
 
     @gl.public.write
@@ -343,6 +412,9 @@ class RealityBet(gl.Contract):
         m.status = MarketStatus.RESOLVED
         m.resolved_at = self._now()
         m.resolver_note = "[FORCED] " + note
+        # A forced outcome gets its own fresh dispute window: payouts stay
+        # locked until that window closes (or the dispute is finally resolved).
+        m.finalized = False
         self.markets[market_id] = m
         return True
 
@@ -351,7 +423,9 @@ class RealityBet(gl.Contract):
         m = self._get_market(market_id)
         if not m.status == MarketStatus.RESOLVED:
             raise gl.vm.UserError("Can only dispute resolved")
-        if not self._now() <= u256(int(m.resolved_at) + 86400):
+        if m.finalized:
+            raise gl.vm.UserError("Market finalized - outcome locked")
+        if not self._now() <= u256(int(m.resolved_at) + DISPUTE_WINDOW):
             raise gl.vm.UserError("Dispute window is 24h")
         sender = gl.message.sender_address
         found = False
@@ -379,6 +453,10 @@ class RealityBet(gl.Contract):
         if d.resolved:
             raise gl.vm.UserError("Already resolved")
         m = self._get_market(d.market_id)
+        if m.finalized:
+            raise gl.vm.UserError("Market finalized - outcome locked")
+        if m.status != MarketStatus.DISPUTED:
+            raise gl.vm.UserError("Dispute no longer active")
         if upheld:
             o = new_outcome.lower().strip()
             if o not in [Outcome.YES, Outcome.NO, Outcome.VOID]:
@@ -392,6 +470,9 @@ class RealityBet(gl.Contract):
             m.status = MarketStatus.RESOLVED
             m.resolver_note = "[DISPUTE REJECTED] " + note
             d.outcome = "rejected"
+        # The dispute is finally resolved, so the outcome is frozen and payouts
+        # open immediately — no second waiting period.
+        m.finalized = True
         d.resolved = True
         self.markets[d.market_id] = m
         self.disputes[dispute_id] = d
@@ -411,6 +492,12 @@ class RealityBet(gl.Contract):
 
     def _market_dict(self, m: Market) -> dict:
         cats = list(m.categories)
+        resolved_at = int(m.resolved_at)
+        # Derived, read-only view of the payout gate: true once the outcome can
+        # no longer change (or straight away for a terminal void).
+        frozen = bool(m.finalized) or (
+            m.status == MarketStatus.RESOLVED and self._window_closed(m)
+        )
         return {"id": m.id, "creator": format(m.creator, "x"), "title": m.title,
                 "description": m.description, "resolution_url": m.resolution_url,
                 "category": cats[0] if len(cats) > 0 else "custom", "categories": cats,
@@ -419,7 +506,9 @@ class RealityBet(gl.Contract):
                 "pool_yes": int(m.pool_yes), "pool_no": int(m.pool_no),
                 "fee_bps": int(m.fee_bps), "resolved_at": int(m.resolved_at),
                 "resolver_note": m.resolver_note, "resolver_confidence": m.resolver_confidence,
-                "resolver_sources": m.resolver_sources}
+                "resolver_sources": m.resolver_sources, "finalized": frozen,
+                "claims_open": frozen or m.status == MarketStatus.VOIDED,
+                "dispute_deadline": resolved_at + DISPUTE_WINDOW if resolved_at > 0 else 0}
 
     def _bet_dict(self, b: Bet) -> dict:
         return {"id": b.id, "market_id": b.market_id, "bettor": format(b.bettor, "x"),

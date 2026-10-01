@@ -6,4 +6,6 @@ Decentralized YES/NO prediction market settled by GenLayer validator consensus o
 
 Consensus: resolver uses gl.eq_principle.prompt_comparative — leader fetches resolution_url + LLM JSON {outcome,confidence,reason,sources}; validators re-fetch/re-run and match `outcome` exactly via EqComparative template. No strict_eq on LLM text, no schema-only validation. Low-confidence/parse-fail auto-voids; confidence+sources stored on-chain for UI; payouts are parimutuel u256 math with fee split via emit_transfer.
 
-Non-trivial: full lifecycle (open/locked/resolved/voided/disputed), TreeMap/DynArray storage, payable pools, dispute + re_resolve + force_resolve, defensive LLM parsing, 11 direct tests with mocked web/LLM, lint-clean.
+Non-trivial: full lifecycle (open/locked/resolved/finalized/voided/disputed), TreeMap/DynArray storage, payable pools, dispute + re_resolve + force_resolve, defensive LLM parsing, 25 direct tests with mocked web/LLM, lint-clean.
+
+Payout safety: `resolved` is not `finalized` — claims revert until the 24h dispute window closes (`finalize_market`, permissionless) or a raised dispute is finally resolved, and the outcome is frozen from the first payout, so no market can pay twice or pay the wrong side. `get_market` exposes `finalized` / `claims_open` / `dispute_deadline`.

@@ -6,6 +6,7 @@ import { CategoryBadge, OutcomeBadge, StatusBadge } from "../components/StatusBa
 import { Btn, Card, ErrorBox, Field, inputCls, PageHeader, Spinner, TxHash } from "../components/ui";
 import {
   claimWinnings,
+  finalizeMarket,
   getMarket,
   getMarketBetsDetailed,
   lockMarket,
@@ -142,7 +143,10 @@ export function MarketDetail() {
   const m = detail.data?.market ?? null;
   const bets = detail.data?.bets ?? [];
   const myBets = bets.filter((b) => address && sameAddress(b.bettor, address));
-  const disputeOpen = m?.status === "resolved" && m.resolved_at > 0 && now <= m.resolved_at + 86400;
+  // A dispute is only possible while the outcome is unfrozen and the window is
+  // still open; the contract enforces the same rule on-chain.
+  const disputeOpen = !!m && m.status === "resolved" && !m.finalized && m.resolved_at > 0 && now <= m.dispute_deadline;
+  const canFinalize = !!m && m.status === "resolved" && !m.finalized && now >= m.dispute_deadline;
   const sortedBets = [...bets].sort((a, b) => b.placed_at - a.placed_at);
 
   return (
@@ -192,6 +196,12 @@ export function MarketDetail() {
               {m.status === "resolved" && m.resolved_at > 0 && (
                 <div className="mt-3 text-sm text-zinc-500">
                   Resolved {fmtDateTime(m.resolved_at)}
+                </div>
+              )}
+              {m.status === "resolved" && !m.claims_open && (
+                <div className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                  Payouts stay locked while the outcome can still be disputed. They unlock
+                  {m.dispute_deadline > 0 ? ` ${fmtDateTime(m.dispute_deadline)} (${countdown(m.dispute_deadline, now)} left)` : " once the dispute window closes"}.
                 </div>
               )}
               {m.resolver_note && (
@@ -297,6 +307,11 @@ export function MarketDetail() {
                     {busy === "AI resolve" ? "AI resolving (minutes)…" : "Request AI resolution"}
                   </Btn>
                 )}
+                {canFinalize && (
+                  <Btn variant="ghost" className="w-full" disabled={busy !== null} onClick={() => address && run("Finalize", () => finalizeMarket(network, address, provider, m.id))}>
+                    {busy === "Finalize" ? "Finalizing…" : "Finalize outcome"}
+                  </Btn>
+                )}
                 {(m.status === "open" || m.status === "locked") && address && sameAddress(m.creator, address) && (
                   <Btn variant="danger" className="w-full" disabled={busy !== null} onClick={() => address && run("Void", () => voidMarket(network, address, provider, m.id))}>
                     Void market
@@ -330,7 +345,7 @@ export function MarketDetail() {
                           {isWinner && payout > 0n && <span className="font-semibold text-emerald-300">+{fmtGen(payout)}</span>}
                           {b.claimed && <span className="text-zinc-500">claimed</span>}
                         </div>
-                        {!b.claimed && m.status === "resolved" && (
+                        {!b.claimed && m.status === "resolved" && m.claims_open && (
                           <Btn className="mt-2 w-full" disabled={busy !== null} onClick={() => address && run("Claim", () => claimWinnings(network, address, provider, b.id))}>
                             Claim winnings
                           </Btn>
@@ -351,7 +366,7 @@ export function MarketDetail() {
               <Card>
                 <h3 className="font-semibold text-white">Raise dispute</h3>
                 <p className="mt-1 text-xs text-zinc-400">
-                  Window closes {fmtDateTime(m.resolved_at + 86400)} ({countdown(m.resolved_at + 86400, now)} left).
+                  Window closes {fmtDateTime(m.dispute_deadline)} ({countdown(m.dispute_deadline, now)} left).
                 </p>
                 <div className="mt-2 space-y-2">
                   <Field label="Reason">

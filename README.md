@@ -48,10 +48,12 @@ Resolution runs inside `gl.eq_principle.prompt_comparative`:
 
 **Defensive post-processing** (protects bettors):
 
-- JSON parse failure → market **VOIDED**
+- JSON parse failure → **void** outcome (a resolved market, so the dispute window still applies)
 - Key aliasing for common LLM variants (`outcome|result|verdict`, `confidence|conf`, etc.)
 - `confidence == "low"` with a non-void outcome → forced **void**
 - Invalid outcome value → **void**
+
+Only `void_market` produces the terminal `VOIDED` status (immediate refunds); every AI outcome — including void — lands on `RESOLVED` and must pass the payout gate below.
 
 On success, the market stores `resolver_confidence` (high/medium/low) and `resolver_sources` (JSON array) alongside `resolver_note`, all surfaced via `get_market` for the UI.
 
@@ -62,22 +64,42 @@ Contract pins its runner: `# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8
 ## Market lifecycle
 
 ```
-OPEN ──► LOCKED ──► RESOLVED ──► claims (winners / losers / void refunds)
-  │          │           │
-  │          │       24h dispute window
-  │          │           │
-  │          │       DISPUTED ──► RESOLVED  (owner ruling or AI re_resolve)
+OPEN ──► LOCKED ──► RESOLVED ──► [24h dispute window] ──► FINALIZED ──► claims
+  │          │           │                                   ▲
+  │          │           └──► DISPUTED ──► outcome ruling ───┘
   │          │
-  └──────────┴──► VOIDED ──► refunds
+  └──────────┴──► VOIDED ──► refunds (terminal, open immediately)
 ```
 
 | State | Meaning |
 |---|---|
 | `open` | Accepting bets (and optional `fund_market` liquidity) |
 | `locked` | Betting closed after `close_time`, awaiting resolution |
-| `resolved` | Outcome finalized; claims open |
-| `voided` | Cancelled — full refunds, no fees |
-| `disputed` | Resolution challenged within 24h of `resolved_at` |
+| `resolved` | Outcome decided — **payouts still locked** for the 24h dispute window |
+| `finalized` | Outcome frozen (window elapsed or dispute resolved); claims open |
+| `voided` | Cancelled — full refunds, no fees, terminal |
+| `disputed` | Resolution challenged within 24h of `resolved_at` — all payouts stopped |
+
+### Payout safety (dispute-window lock)
+
+`resolved` is **not** `finalized`. The contract refuses every payout until the
+outcome can no longer change:
+
+- `claim_winnings` reverts with `Dispute window open - payouts locked` while a
+  `RESOLVED` market is inside its 24h window, and again (`Market not resolved`)
+  while it is `DISPUTED`.
+- `finalize_market(market_id)` — permissionless — freezes the outcome once
+  `now >= resolved_at + 86400`; a claim made after the window freezes it too.
+- `resolve_dispute` freezes the market the moment the dispute is finally
+  resolved (upheld *or* rejected), so ruling on a dispute unlocks payouts
+  without a second waiting period.
+- Once `finalized`, `force_resolve`, `re_resolve`, `resolve_dispute` and
+  `raise_dispute` all revert: **an outcome cannot change after funds are paid**.
+- `VOIDED` (only reachable through `void_market`) is terminal — no outcome can
+  ever be set on it — so `refund_void` is open immediately.
+
+`get_market` exposes the gate for UIs: `finalized`, `claims_open` and
+`dispute_deadline`.
 
 ---
 
@@ -99,7 +121,7 @@ net   = gross - fee
 
 ## Contract API
 
-Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class `RealityBet(gl.Contract)`, 26 public methods.
+Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class `RealityBet(gl.Contract)`, 27 public methods.
 
 ### Storage
 
@@ -110,7 +132,7 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 | `owner` | `Address` |
 | `platform_fee_bps`, `total_volume`, counters | `u256` |
 
-**Market** includes multi-tag `categories: DynArray[str]` (20 categories: sports, politics, crypto, tech, science, entertainment, finance, economy, business, world, health, weather, gaming, esports, social, culture, education, environment, space, custom — 1–5 tags, deduped), `resolution_url`, pools, status, and resolver metadata (`resolver_note`, `resolver_confidence`, `resolver_sources`).
+**Market** includes multi-tag `categories: DynArray[str]` (20 categories: sports, politics, crypto, tech, science, entertainment, finance, economy, business, world, health, weather, gaming, esports, social, culture, education, environment, space, custom — 1–5 tags, deduped), `resolution_url`, pools, status, `finalized: bool`, and resolver metadata (`resolver_note`, `resolver_confidence`, `resolver_sources`).
 
 ### Write methods
 
@@ -118,11 +140,12 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 |---|---|---|
 | `create_market(title, description, resolution_url, categories, close_time, resolve_time)` | anyone | Create market; validates future close, `resolve ≥ close`, valid categories |
 | `lock_market(market_id)` | anyone after `close_time` | `OPEN → LOCKED` |
-| `void_market(market_id)` | creator / owner | `OPEN/LOCKED → VOIDED` |
+| `void_market(market_id)` | creator / owner | `OPEN/LOCKED → VOIDED` (terminal, refunds open) |
+| `finalize_market(market_id)` | anyone after the dispute window | Freeze the outcome and unlock payouts |
 | `fund_market(market_id)` *(payable)* | anyone while `OPEN` | Splits sent GEN half YES / half NO (bootstrap liquidity) |
 | `place_bet(market_id, side)` *(payable)* | anyone before close | Stake GEN on `yes` or `no`; updates pools + `total_volume` |
-| `claim_winnings(bet_id)` | bettor | Payout after `RESOLVED` (win / void refund / 0) |
-| `refund_void(bet_id)` | bettor | Full refund after `VOIDED` |
+| `claim_winnings(bet_id)` | bettor | Payout once the outcome is **finalized** (win / void refund / 0) |
+| `refund_void(bet_id)` | bettor | Full refund on a `VOIDED` market |
 | `request_resolution(market_id)` | anyone after `resolve_time` | Runs AI `_resolve` on a `LOCKED` market |
 | `force_resolve(market_id, outcome, note)` | owner | Emergency override (`LOCKED/DISPUTED`) |
 | `raise_dispute(market_id, reason)` | bettor ≤24h post-resolution | `RESOLVED → DISPUTED` |
@@ -159,10 +182,13 @@ request_resolution / re_resolve
              )
                     │
                     ▼
-        defensive parse → RESOLVED | VOIDED
+        defensive parse → RESOLVED (outcome yes | no | void)
 ```
 
-Disputes: a bettor has **24h** after `resolved_at` to `raise_dispute`. The owner can `resolve_dispute` (uphold / reject) or `re_resolve` to re-run the AI with fresh web state. `force_resolve` is the last-resort manual override.
+Disputes: a bettor has **24h** after `resolved_at` to `raise_dispute`. The owner can `resolve_dispute` (uphold / reject) or `re_resolve` to re-run the AI with fresh web state. `force_resolve` is the last-resort manual override; like the others it starts a fresh dispute window, and all of them refuse to touch a finalized market.
+
+Payouts open only when the outcome is frozen: the window closes (`finalize_market`, or lazily on the first post-window claim) or a dispute is finally resolved. A market that is still `resolved`-but-unfrozen, or `disputed`, pays nothing.
+
 
 ---
 
@@ -193,13 +219,15 @@ React **19** + TypeScript + **Vite** + **Tailwind CSS 4** + **react-router-dom 7
 **Environment** (`frontend/.env.example`):
 
 ```
-VITE_CONTRACT_ADDRESS=0x5809744633d425b3b419567021510f6B42E5AC60
+VITE_CONTRACT_ADDRESS=0xFADb7e363F48E86312520F78C87b5A4D5c4f928b
 VITE_NETWORK=studionet
 VITE_RPC_URL=            # optional absolute URL or "direct"
 VITE_SEED_MARKETS=       # optional comma-separated market ids
 ```
 
-**Deployed contract:** [`0x5809744633d425b3b419567021510f6B42E5AC60`](https://explorer-studio.genlayer.com/address/0x5809744633d425b3b419567021510f6B42E5AC60) on **GenLayer Studio** (chain id 61999).
+**Deployed contract:** [`0xFADb7e363F48E86312520F78C87b5A4D5c4f928b`](https://explorer-studio.genlayer.com/address/0xFADb7e363F48E86312520F78C87b5A4D5c4f928b) on **GenLayer Studio** (chain id 61999).
+
+> Deploy tx [`0x4752320e…9073ed`](https://explorer-studio.genlayer.com/tx/0x4752320e85b2661ce52bf4022ae2a887a4db3b6db958201c9c1c24f6f59073ed) → `FINALIZED / SUCCESS`. This address replaces the earlier `0x5809…AC60` deployment, which predates the payout gate; it starts empty, so markets must be created (or re-seeded) on the new instance.
 
 ---
 
@@ -214,10 +242,10 @@ Reality-Bet-Genlayer/
 ├── docs/
 │   └── images/                # hero + UI screenshots
 ├── contracts/
-│   └── RealityBet.py          # single Intelligent Contract (~570 lines)
+│   └── RealityBet.py          # single Intelligent Contract (~650 lines)
 ├── tests/
 │   └── direct/
-│       └── test_realitybet.py # 17 direct-mode pytest tests (mocked web + LLM)
+│       └── test_realitybet.py # 25 direct-mode pytest tests (mocked web + LLM)
 └── frontend/
     ├── package.json           # React 19 + Vite + genlayer-js
     ├── vite.config.ts         # /api/rpc → studio.genlayer.com (dev)
@@ -262,7 +290,7 @@ Direct-mode tests with **mocked web + LLM** (`direct_vm.mock_web`, `direct_vm.mo
 pytest tests/direct/ -v
 ```
 
-Requires an environment where the `genlayer-test` pytest plugin is active (e.g. a venv with `genlayer-test` installed). 17 tests cover:
+Requires an environment where the `genlayer-test` pytest plugin is active (e.g. a venv with `genlayer-test` installed). 25 tests cover:
 
 - Market creation (single/multi-category, dedupe, invalid reverts)
 - Betting, odds, place-bet on both sides
@@ -270,6 +298,8 @@ Requires an environment where the `genlayer-test` pytest plugin is active (e.g. 
 - Resolve YES/NO payouts, fee split (200 bps), loser = 0
 - Void refunds, low-confidence auto-void, duplicate claim revert
 - Dispute → uphold / outcome flip
+- Payout gate: early claim rejected, `finalize_market` rejected inside the window, dispute flips the outcome and pays the real winners solvently, outcome sealed after funds move, window-elapsed finalization, disputed-window AI void refunds
+- Payout-gate adversarial paths: a rejected dispute unlocks payouts the same second, a dispute left dangling by `force_resolve` can never be ruled on (especially not after a payout), `re_resolve` re-locks payouts for a fresh window, and two disputes on one market can never both land — one pool, one winner set
 - Pagination (`get_market_ids` newest-first, string-sort edge case)
 - `get_market_bets_detailed` ordering
 - `get_bettor_bets` 0x / bare-hex address regression
@@ -332,6 +362,7 @@ Current production: **https://reality-bet.vercel.app**
 | **Auto-void on low confidence / parse failure** | Protecting bettors from bad resolutions preserves platform trust over forcing a wrong outcome |
 | **Parimutuel u256 math** | Natural price discovery from pool ratios; no external odds oracle |
 | **24h dispute window** | Enough time for losers to challenge without locking winner funds indefinitely |
+| **Payouts locked until finalized** | Nothing is paid while the outcome is appealable, and the outcome is frozen from the first payout, so a resolved-then-flipped market can never pay twice or pay the wrong side |
 | **`re_resolve` on dispute** | Re-running AI with fresh web state beats manual arbitration for most cases; `force_resolve` is the fallback |
 | **Multi-tag categories (1–5)** | Markets often span topics (e.g. politics + world); improves discovery |
 | **On-chain pagination** | `get_markets_page` / `get_market_ids` scale without client-side full scans |

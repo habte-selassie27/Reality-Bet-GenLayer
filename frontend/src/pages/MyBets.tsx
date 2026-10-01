@@ -17,6 +17,8 @@ interface Row extends Bet {
   marketTitle: string;
   marketStatus: string;
   marketOutcome: string;
+  marketClaimsOpen: boolean;
+  marketDisputeDeadline: number;
 }
 
 /**
@@ -54,6 +56,8 @@ export function MyBets() {
           marketTitle: mk?.title ?? b.market_id,
           marketStatus: mk?.status ?? "",
           marketOutcome: mk?.outcome ?? "",
+          marketClaimsOpen: mk?.claims_open ?? false,
+          marketDisputeDeadline: mk?.dispute_deadline ?? 0,
         };
       })
       .sort((a, b) => b.placed_at - a.placed_at);
@@ -109,10 +113,16 @@ export function MyBets() {
               <div className="mt-1 font-mono text-xs text-zinc-500">
                 market {b.marketStatus}{b.marketOutcome ? ` · outcome ${b.marketOutcome}` : ""} · bet {b.id}
               </div>
-              {!b.claimed && b.marketStatus === "resolved" && (
+              {!b.claimed && b.marketStatus === "resolved" && b.marketClaimsOpen && (
                 <Btn className="mt-3" disabled={busyId === b.id} onClick={() => act(b.id, "claim")}>
                   {busyId === b.id ? "Claiming…" : "Claim winnings"}
                 </Btn>
+              )}
+              {!b.claimed && b.marketStatus === "resolved" && !b.marketClaimsOpen && (
+                <div className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                  Locked until the dispute window closes
+                  {b.marketDisputeDeadline > 0 ? ` (${fmtDateTime(b.marketDisputeDeadline)})` : ""}.
+                </div>
               )}
               {!b.claimed && b.marketStatus === "voided" && (
                 <Btn className="mt-3" disabled={busyId === b.id} onClick={() => act(b.id, "refund")}>

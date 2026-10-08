@@ -68,6 +68,20 @@ class Bet:
     amount: u256
     claimed: bool
     placed_at: u256
+    # Recorded at claim/refund time. Persisting the exact payout is what
+    # makes a failed (or never-delivered) transfer recoverable: retry_payout
+    # and retry_refund re-emit this recorded value.
+    payout: u256
+
+
+@allow_storage
+@dataclass
+class Funding:
+    id: str
+    market_id: str
+    funder: Address
+    amount: u256
+    refunded: bool
 
 
 @allow_storage
@@ -93,6 +107,9 @@ class RealityBet(gl.Contract):
     market_count: u256
     bet_count: u256
     dispute_count: u256
+    fundings: TreeMap[str, Funding]
+    market_fundings: TreeMap[str, DynArray[str]]
+    funding_count: u256
 
     def __init__(self):
         self.owner = gl.message.sender_address
@@ -101,6 +118,7 @@ class RealityBet(gl.Contract):
         self.market_count = u256(0)
         self.bet_count = u256(0)
         self.dispute_count = u256(0)
+        self.funding_count = u256(0)
 
     def _now(self) -> u256:
         return u256(int(datetime.now(timezone.utc).timestamp()))
@@ -227,6 +245,14 @@ class RealityBet(gl.Contract):
         m.pool_no = u256(int(m.pool_no) + int(v) - int(half))
         self.total_volume = u256(int(self.total_volume) + int(v))
         self.markets[market_id] = m
+        # Liquidity deposits are subsidies paid into the winning pool, but the
+        # funder still needs a redeemable/refundable entitlement on record —
+        # otherwise VOIDED (or VOID-outcome) markets would lock the deposit
+        # forever.
+        fid = "f" + str(int(self.funding_count)) + "-" + str(int(self._now()))
+        self.funding_count = u256(int(self.funding_count) + 1)
+        self.fundings[fid] = Funding(fid, market_id, gl.message.sender_address, v, False)
+        self.market_fundings.get_or_insert_default(market_id).append(fid)
         return True
 
     @gl.public.write.payable
@@ -246,7 +272,7 @@ class RealityBet(gl.Contract):
         now = self._now()
         bid = "b" + str(int(self.bet_count)) + "-" + str(int(now))
         self.bet_count = u256(int(self.bet_count) + 1)
-        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now)
+        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now, u256(0))
         self.market_bets.get_or_insert_default(market_id).append(bid)
         key = self._addr_key(bettor)
         self.bettor_bets.get_or_insert_default(key).append(bid)
@@ -287,11 +313,31 @@ class RealityBet(gl.Contract):
                 payout = u256(int(gross) - int(fee))
                 if int(fee) > 0:
                     gl.get_contract_at(self.owner).emit_transfer(value=fee)
+        b.payout = payout
         b.claimed = True
         self.bets[bet_id] = b
         if int(payout) > 0:
+            # Transfers are async (PostMessage on 'finalized'): they can fail
+            # after the state change commits. The recorded b.payout keeps the
+            # entitlement recoverable through retry_payout.
             gl.get_contract_at(b.bettor).emit_transfer(value=payout)
         return payout
+
+    @gl.public.write
+    def retry_payout(self, bet_id: str) -> u256:
+        """Re-emit a previously recorded payout whose transfer never landed."""
+        b = self._get_bet(bet_id)
+        m = self._get_market(b.market_id)
+        if not b.bettor == gl.message.sender_address:
+            raise gl.vm.UserError("Not your bet")
+        if not b.claimed:
+            raise gl.vm.UserError("Nothing to retry - claim first")
+        if not m.status == MarketStatus.RESOLVED:
+            raise gl.vm.UserError("Market not resolved")
+        if int(b.payout) <= 0:
+            raise gl.vm.UserError("No payout recorded for this bet")
+        gl.get_contract_at(b.bettor).emit_transfer(value=b.payout)
+        return b.payout
 
     @gl.public.write
     def refund_void(self, bet_id: str) -> bool:
@@ -306,10 +352,50 @@ class RealityBet(gl.Contract):
         # No dispute gate here by design: VOIDED is only reachable through
         # void_market, is terminal, and no method can set an outcome on it — so
         # the refund can never be paid against an outcome that later flips.
+        b.payout = b.amount
         b.claimed = True
         self.bets[bet_id] = b
         gl.get_contract_at(b.bettor).emit_transfer(value=b.amount)
         return True
+
+    @gl.public.write
+    def retry_refund(self, bet_id: str) -> u256:
+        """Re-emit a voided-market refund whose transfer never landed."""
+        b = self._get_bet(bet_id)
+        m = self._get_market(b.market_id)
+        if not b.bettor == gl.message.sender_address:
+            raise gl.vm.UserError("Not your bet")
+        if not b.claimed:
+            raise gl.vm.UserError("Nothing to retry - refund first")
+        if not m.status == MarketStatus.VOIDED:
+            raise gl.vm.UserError("Market not voided")
+        payout = b.payout if int(b.payout) > 0 else b.amount
+        gl.get_contract_at(b.bettor).emit_transfer(value=payout)
+        return payout
+
+    @gl.public.write
+    def refund_funding(self, funding_id: str) -> u256:
+        """Return a liquidity deposit when the market is VOIDED or resolves VOID."""
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        m = self._get_market(f.market_id)
+        if not f.funder == gl.message.sender_address:
+            raise gl.vm.UserError("Not your funding")
+        if f.refunded:
+            raise gl.vm.UserError("Already refunded")
+        if m.status == MarketStatus.VOIDED:
+            refundable = True
+        elif m.status == MarketStatus.RESOLVED and m.outcome == Outcome.VOID and self._claims_open(m):
+            refundable = True
+        else:
+            refundable = False
+        if not refundable:
+            raise gl.vm.UserError("Funding not refundable yet")
+        f.refunded = True
+        self.fundings[funding_id] = f
+        gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
+        return f.amount
 
     @gl.public.write
     def request_resolution(self, market_id: str) -> bool:
@@ -513,7 +599,7 @@ class RealityBet(gl.Contract):
     def _bet_dict(self, b: Bet) -> dict:
         return {"id": b.id, "market_id": b.market_id, "bettor": format(b.bettor, "x"),
                 "side": b.side, "amount": int(b.amount), "claimed": b.claimed,
-                "placed_at": int(b.placed_at)}
+                "placed_at": int(b.placed_at), "payout": int(b.payout)}
 
     def _seq(self, mid: str) -> int:
         """Sort key for "m<count>-<timestamp>" ids — string order would put m10 before m2."""
@@ -589,6 +675,20 @@ class RealityBet(gl.Contract):
         for bid in self._bettor_bet_ids(bettor):
             out.append(self._bet_dict(self._get_bet(bid)))
         return out
+
+    @gl.public.view
+    def get_funding(self, funding_id: str) -> dict:
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        return {"id": f.id, "market_id": f.market_id, "funder": format(f.funder, "x"),
+                "amount": int(f.amount), "refunded": f.refunded}
+
+    @gl.public.view
+    def get_market_fundings(self, market_id: str) -> typing.Any:
+        if market_id not in self.market_fundings:
+            return []
+        return list(self.market_fundings[market_id])
 
     @gl.public.view
     def get_dispute(self, dispute_id: str) -> dict:

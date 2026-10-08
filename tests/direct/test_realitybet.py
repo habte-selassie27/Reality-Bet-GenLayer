@@ -736,3 +736,152 @@ def test_only_one_dispute_can_ever_land_an_outcome(
     direct_vm.sender = direct_bob
     assert int(contract.claim_winnings(bid_no)) == 0
     assert 9850 + 0 <= 6000 + 4000
+
+
+def _capture_transfers(direct_vm):
+    """Install a gl_call hook that records every PostMessage (value transfer)."""
+    emitted = []
+
+    def hook(vm, request):
+        if isinstance(request, dict) and "PostMessage" in request:
+            emitted.append(request["PostMessage"])
+            return {"ok": None}
+        return None
+
+    direct_vm._gl_call_hook = hook
+    return emitted
+
+
+def _payouts_to(emitted, addr):
+    return [e for e in emitted if str(e["address"]).lower() == _hex(addr).lower()]
+
+
+def test_fund_market_records_entitlement_and_void_recovers(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    assert contract.fund_market(mid) is True
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    assert len(fids) == 1
+    f = contract.get_funding(fids[0])
+    assert f["amount"] == 500
+    assert f["funder"].lower() == _hex(direct_alice).lower()
+    assert f["refunded"] is False
+    odds = contract.get_odds(mid)
+    assert odds["pool_yes"] + odds["pool_no"] == 500
+    with direct_vm.expect_revert("Funding not refundable yet"):
+        contract.refund_funding(fids[0])
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+    direct_vm.sender = direct_alice
+    assert int(contract.refund_funding(fids[0])) == 500
+    assert contract.get_funding(fids[0])["refunded"] is True
+    with direct_vm.expect_revert("Already refunded"):
+        contract.refund_funding(fids[0])
+
+
+def test_fund_market_void_outcome_resolution_recovers(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 700
+    contract.fund_market(mid)
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "void", "low")
+    contract.request_resolution(mid)
+    m = contract.get_market(mid)
+    assert m["status"] == "resolved" and m["outcome"] == "void"
+    _past_dispute_window(direct_vm)
+    direct_vm.sender = direct_alice
+    assert int(contract.refund_funding(fids[0])) == 700
+
+
+def test_refund_funding_rejects_non_funder(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 400
+    contract.fund_market(mid)
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Not your funding"):
+        contract.refund_funding(fids[0])
+
+
+def test_failed_payout_keeps_entitlement_and_retry_replays(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
+
+    emitted = _capture_transfers(direct_vm)
+    direct_vm.sender = direct_alice
+    payout = int(contract.claim_winnings(bid))
+    assert payout == 985
+    b = contract.get_bet(bid)
+    assert b["claimed"] is True and b["payout"] == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    assert int(_payouts_to(emitted, direct_alice)[0]["value"]) == 985
+
+    # The async transfer never landed (no delivery confirmed). The entitlement
+    # is still on the bet, so the bettor can replay it instead of losing it.
+    direct_vm.sender = direct_alice
+    assert int(contract.retry_payout(bid)) == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 2
+    assert int(_payouts_to(emitted, direct_alice)[1]["value"]) == 985
+    with direct_vm.expect_revert("Already claimed"):
+        contract.claim_winnings(bid)
+
+
+def test_failed_refund_retry_replays(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1200
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+
+    emitted = _capture_transfers(direct_vm)
+    direct_vm.sender = direct_alice
+    assert contract.refund_void(bid) is True
+    assert contract.get_bet(bid)["payout"] == 1200
+    assert len(emitted) == 1 and int(emitted[0]["value"]) == 1200
+    direct_vm.sender = direct_alice
+    assert int(contract.retry_refund(bid)) == 1200
+    assert len(emitted) == 2 and int(emitted[1]["value"]) == 1200
+    with direct_vm.expect_revert("Already claimed"):
+        contract.refund_void(bid)

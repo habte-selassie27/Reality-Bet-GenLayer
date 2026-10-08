@@ -146,6 +146,9 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 | `place_bet(market_id, side)` *(payable)* | anyone before close | Stake GEN on `yes` or `no`; updates pools + `total_volume` |
 | `claim_winnings(bet_id)` | bettor | Payout once the outcome is **finalized** (win / void refund / 0) |
 | `refund_void(bet_id)` | bettor | Full refund on a `VOIDED` market |
+| `retry_payout(bet_id)` | bettor | Re-emit the recorded payout if the async transfer never landed |
+| `retry_refund(bet_id)` | bettor | Re-emit a voided-market refund if the transfer never landed |
+| `refund_funding(funding_id)` | funder | Full refund of a `fund_market` deposit when the market is `VOIDED` or resolves `VOID` |
 | `request_resolution(market_id)` | anyone after `resolve_time` | Runs AI `_resolve` on a `LOCKED` market |
 | `force_resolve(market_id, outcome, note)` | owner | Emergency override (`LOCKED/DISPUTED`) |
 | `raise_dispute(market_id, reason)` | bettor ≤24h post-resolution | `RESOLVED → DISPUTED` |
@@ -154,9 +157,13 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 | `set_fee(bps)` | owner | Max 500 (5%) |
 | `transfer_ownership(new_owner)` | owner | Transfer admin |
 
+### Entitlement / recovery records
+
+`fund_market` records a `Funding` (id, market, funder, amount, refunded) per deposit and joins the amount to the pools, so liquidity is never an anonymous, unrecoverable transfer. `Bet.payout` stores the exact amount emitted at claim/refund time; `retry_payout` / `retry_refund` replay it when the async `emit_transfer` delivery fails.
+
 ### View methods
 
-`get_market` · `get_market_ids(offset, limit)` · `get_markets_page(offset, limit)` (newest-first, cap 50) · `get_bet` · `get_market_bets_detailed` · `get_bets_by_bettor` · `get_dispute` · `get_market_bets` · `get_bettor_bets` (0x-normalized) · `get_odds` · `get_market_stats` · `get_platform_stats`
+`get_market` · `get_market_ids(offset, limit)` · `get_markets_page(offset, limit)` (newest-first, cap 50) · `get_bet` · `get_market_bets_detailed` · `get_bets_by_bettor` · `get_funding` · `get_market_fundings` · `get_dispute` · `get_market_bets` · `get_bettor_bets` (0x-normalized) · `get_odds` · `get_market_stats` · `get_platform_stats`
 
 IDs are sequential: `m{count}-{ts}`, `b{count}-{ts}`, `d{count}-{ts}`. Time comes from `datetime.now(timezone.utc)`; errors use `raise gl.vm.UserError(...)`.
 
@@ -245,7 +252,7 @@ Reality-Bet-Genlayer/
 │   └── RealityBet.py          # single Intelligent Contract (~650 lines)
 ├── tests/
 │   └── direct/
-│       └── test_realitybet.py # 25 direct-mode pytest tests (mocked web + LLM)
+│       └── test_realitybet.py # 30 direct-mode pytest tests (mocked web + LLM)
 └── frontend/
     ├── package.json           # React 19 + Vite + genlayer-js
     ├── vite.config.ts         # /api/rpc → studio.genlayer.com (dev)
@@ -290,7 +297,7 @@ Direct-mode tests with **mocked web + LLM** (`direct_vm.mock_web`, `direct_vm.mo
 pytest tests/direct/ -v
 ```
 
-Requires an environment where the `genlayer-test` pytest plugin is active (e.g. a venv with `genlayer-test` installed). 25 tests cover:
+Requires an environment where the `genlayer-test` pytest plugin is active (e.g. a venv with `genlayer-test` installed). 30 tests cover:
 
 - Market creation (single/multi-category, dedupe, invalid reverts)
 - Betting, odds, place-bet on both sides
@@ -303,6 +310,8 @@ Requires an environment where the `genlayer-test` pytest plugin is active (e.g. 
 - Pagination (`get_market_ids` newest-first, string-sort edge case)
 - `get_market_bets_detailed` ordering
 - `get_bettor_bets` 0x / bare-hex address regression
+- Liquidity entitlements: `fund_market` records a `Funding`, rejected pre-void, full refund on `VOIDED` and on VOID-outcome resolution, non-funder revert
+- Failed async payouts: recorded `Bet.payout` survives a lost transfer and `retry_payout` / `retry_refund` re-emit it exactly once
 
 > Note: direct mode runs the **leader only**; full validator consensus runs on-chain.
 

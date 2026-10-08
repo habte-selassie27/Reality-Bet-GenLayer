@@ -146,9 +146,12 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 | `place_bet(market_id, side)` *(payable)* | anyone before close | Stake GEN on `yes` or `no`; updates pools + `total_volume` |
 | `claim_winnings(bet_id)` | bettor | Payout once the outcome is **finalized** (win / void refund / 0) |
 | `refund_void(bet_id)` | bettor | Full refund on a `VOIDED` market |
-| `retry_payout(bet_id)` | bettor | Re-emit the recorded payout if the async transfer never landed |
-| `retry_refund(bet_id)` | bettor | Re-emit a voided-market refund if the transfer never landed |
-| `refund_funding(funding_id)` | funder | Full refund of a `fund_market` deposit when the market is `VOIDED` or resolves `VOID` |
+| `retry_payout(bet_id)` | bettor | Re-emit the recorded payout — only after a delivery failure is explicitly reported |
+| `retry_refund(bet_id)` | bettor | Re-emit a voided-market refund — only after a delivery failure is explicitly reported |
+| `report_failed_payout(bet_id)` / `confirm_payout(bet_id)` | bettor / owner | Attest the delivery outcome of a payout or refund transfer |
+| `refund_funding(funding_id)` | funder | Full refund of a `fund_market` deposit when the market is `VOIDED` or resolves `VOID`; entitlement stays unconsumed until delivery is confirmed |
+| `retry_funding_refund(funding_id)` | funder | Re-emit the funding refund if its async transfer never landed (failure reported) |
+| `report_failed_funding_refund(funding_id)` / `confirm_funding_refund(funding_id)` | funder / owner | Attest the funding-refund delivery outcome |
 | `request_resolution(market_id)` | anyone after `resolve_time` | Runs AI `_resolve` on a `LOCKED` market |
 | `force_resolve(market_id, outcome, note)` | owner | Emergency override (`LOCKED/DISPUTED`) |
 | `raise_dispute(market_id, reason)` | bettor ≤24h post-resolution | `RESOLVED → DISPUTED` |
@@ -159,7 +162,7 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 
 ### Entitlement / recovery records
 
-`fund_market` records a `Funding` (id, market, funder, amount, refunded) per deposit and joins the amount to the pools, so liquidity is never an anonymous, unrecoverable transfer. `Bet.payout` stores the exact amount emitted at claim/refund time; `retry_payout` / `retry_refund` replay it when the async `emit_transfer` delivery fails.
+`fund_market` records a `Funding` (id, market, funder, amount, refunded) per deposit and joins the amount to the pools, so liquidity is never an anonymous, unrecoverable transfer. `Bet.payout` stores the exact amount emitted at claim/refund time; `retry_payout` / `retry_refund` replay it only after a failure is attested via `report_failed_payout`, and `confirm_payout` locks the entitlement once delivery succeeds. Every payout/refund transfer runs through a delivery state machine (`attempted → failed → recovered`, or `attempted → delivered`), so a retry can never double-emit a transfer that was never marked failed. `refund_funding` emits the refund but leaves `refunded` false until `confirm_funding_refund` attests delivery; `retry_funding_refund` recovers a failed funding transfer.
 
 ### View methods
 
@@ -311,7 +314,7 @@ Requires an environment where the `genlayer-test` pytest plugin is active (e.g. 
 - `get_market_bets_detailed` ordering
 - `get_bettor_bets` 0x / bare-hex address regression
 - Liquidity entitlements: `fund_market` records a `Funding`, rejected pre-void, full refund on `VOIDED` and on VOID-outcome resolution, non-funder revert
-- Failed async payouts: recorded `Bet.payout` survives a lost transfer and `retry_payout` / `retry_refund` re-emit it exactly once
+- Failed async payouts: recorded `Bet.payout` survives a lost transfer; `report_failed_payout` + `retry_payout` / `retry_refund` recover it exactly once, and `confirm_payout` permanently locks delivered transfers
 
 > Note: direct mode runs the **leader only**; full validator consensus runs on-chain.
 

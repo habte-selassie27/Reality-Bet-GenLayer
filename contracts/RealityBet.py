@@ -72,6 +72,14 @@ class Bet:
     # makes a failed (or never-delivered) transfer recoverable: retry_payout
     # and retry_refund re-emit this recorded value.
     payout: u256
+    # Delivery state machine for the payout transfer:
+    #   ""          -> no payout transfer was ever emitted
+    #   "attempted" -> emitted, delivery not yet confirmed
+    #   "failed"    -> payee/owner explicitly reported non-delivery; the
+    #                  entitlement is eligible for exactly one retry
+    #   "recovered" -> a retry transfer was emitted, awaiting delivery
+    #   "delivered" -> delivery confirmed; retries are permanently locked
+    payout_status: str
 
 
 @allow_storage
@@ -82,6 +90,10 @@ class Funding:
     funder: Address
     amount: u256
     refunded: bool
+    # Same delivery state machine as Bet.payout_status. The `refunded` flag
+    # only flips once delivery is confirmed — it is never consumed up-front
+    # before the async transfer lands.
+    refund_status: str
 
 
 @allow_storage
@@ -251,7 +263,7 @@ class RealityBet(gl.Contract):
         # forever.
         fid = "f" + str(int(self.funding_count)) + "-" + str(int(self._now()))
         self.funding_count = u256(int(self.funding_count) + 1)
-        self.fundings[fid] = Funding(fid, market_id, gl.message.sender_address, v, False)
+        self.fundings[fid] = Funding(fid, market_id, gl.message.sender_address, v, False, "")
         self.market_fundings.get_or_insert_default(market_id).append(fid)
         return True
 
@@ -272,7 +284,7 @@ class RealityBet(gl.Contract):
         now = self._now()
         bid = "b" + str(int(self.bet_count)) + "-" + str(int(now))
         self.bet_count = u256(int(self.bet_count) + 1)
-        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now, u256(0))
+        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now, u256(0), "")
         self.market_bets.get_or_insert_default(market_id).append(bid)
         key = self._addr_key(bettor)
         self.bettor_bets.get_or_insert_default(key).append(bid)
@@ -315,6 +327,7 @@ class RealityBet(gl.Contract):
                     gl.get_contract_at(self.owner).emit_transfer(value=fee)
         b.payout = payout
         b.claimed = True
+        b.payout_status = "attempted" if int(payout) > 0 else ""
         self.bets[bet_id] = b
         if int(payout) > 0:
             # Transfers are async (PostMessage on 'finalized'): they can fail
@@ -336,8 +349,38 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Market not resolved")
         if int(b.payout) <= 0:
             raise gl.vm.UserError("No payout recorded for this bet")
+        # Retries are gated on an explicit failure report: re-emitting a
+        # transfer whose delivery was never marked failed would be a double-pay.
+        if b.payout_status != "failed":
+            raise gl.vm.UserError("Prior delivery not marked failed - no retry allowed")
         gl.get_contract_at(b.bettor).emit_transfer(value=b.payout)
+        b.payout_status = "recovered"
+        self.bets[bet_id] = b
         return b.payout
+
+    @gl.public.write
+    def report_failed_payout(self, bet_id: str) -> bool:
+        """Bettor or owner attests that the payout transfer never landed."""
+        b = self._get_bet(bet_id)
+        if gl.message.sender_address not in (b.bettor, self.owner):
+            raise gl.vm.UserError("Not authorized")
+        if b.payout_status not in ("attempted", "recovered"):
+            raise gl.vm.UserError("No unconfirmed payout to report")
+        b.payout_status = "failed"
+        self.bets[bet_id] = b
+        return True
+
+    @gl.public.write
+    def confirm_payout(self, bet_id: str) -> bool:
+        """Bettor or owner confirms the payout transfer delivered."""
+        b = self._get_bet(bet_id)
+        if gl.message.sender_address not in (b.bettor, self.owner):
+            raise gl.vm.UserError("Not authorized")
+        if b.payout_status not in ("attempted", "recovered"):
+            raise gl.vm.UserError("No unconfirmed payout to confirm")
+        b.payout_status = "delivered"
+        self.bets[bet_id] = b
+        return True
 
     @gl.public.write
     def refund_void(self, bet_id: str) -> bool:
@@ -354,6 +397,7 @@ class RealityBet(gl.Contract):
         # the refund can never be paid against an outcome that later flips.
         b.payout = b.amount
         b.claimed = True
+        b.payout_status = "attempted"
         self.bets[bet_id] = b
         gl.get_contract_at(b.bettor).emit_transfer(value=b.amount)
         return True
@@ -370,7 +414,11 @@ class RealityBet(gl.Contract):
         if not m.status == MarketStatus.VOIDED:
             raise gl.vm.UserError("Market not voided")
         payout = b.payout if int(b.payout) > 0 else b.amount
+        if b.payout_status != "failed":
+            raise gl.vm.UserError("Prior delivery not marked failed - no retry allowed")
         gl.get_contract_at(b.bettor).emit_transfer(value=payout)
+        b.payout_status = "recovered"
+        self.bets[bet_id] = b
         return payout
 
     @gl.public.write
@@ -392,10 +440,54 @@ class RealityBet(gl.Contract):
             refundable = False
         if not refundable:
             raise gl.vm.UserError("Funding not refundable yet")
-        f.refunded = True
+        if f.refund_status != "":
+            raise gl.vm.UserError("Refund already requested")
+        f.refund_status = "attempted"
         self.fundings[funding_id] = f
         gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
         return f.amount
+
+    @gl.public.write
+    def retry_funding_refund(self, funding_id: str) -> u256:
+        """Re-emit a funding refund only after its delivery is marked failed."""
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        if not f.funder == gl.message.sender_address:
+            raise gl.vm.UserError("Not your funding")
+        if f.refund_status != "failed":
+            raise gl.vm.UserError("Prior delivery not marked failed - no retry allowed")
+        gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
+        f.refund_status = "recovered"
+        self.fundings[funding_id] = f
+        return f.amount
+
+    @gl.public.write
+    def report_failed_funding_refund(self, funding_id: str) -> bool:
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        if gl.message.sender_address not in (f.funder, self.owner):
+            raise gl.vm.UserError("Not authorized")
+        if f.refund_status not in ("attempted", "recovered"):
+            raise gl.vm.UserError("No unconfirmed refund to report")
+        f.refund_status = "failed"
+        self.fundings[funding_id] = f
+        return True
+
+    @gl.public.write
+    def confirm_funding_refund(self, funding_id: str) -> bool:
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        if gl.message.sender_address not in (f.funder, self.owner):
+            raise gl.vm.UserError("Not authorized")
+        if f.refund_status not in ("attempted", "recovered"):
+            raise gl.vm.UserError("No unconfirmed refund to confirm")
+        f.refund_status = "delivered"
+        f.refunded = True
+        self.fundings[funding_id] = f
+        return True
 
     @gl.public.write
     def request_resolution(self, market_id: str) -> bool:
@@ -599,7 +691,8 @@ class RealityBet(gl.Contract):
     def _bet_dict(self, b: Bet) -> dict:
         return {"id": b.id, "market_id": b.market_id, "bettor": format(b.bettor, "x"),
                 "side": b.side, "amount": int(b.amount), "claimed": b.claimed,
-                "placed_at": int(b.placed_at), "payout": int(b.payout)}
+                "placed_at": int(b.placed_at), "payout": int(b.payout),
+                "payout_status": b.payout_status}
 
     def _seq(self, mid: str) -> int:
         """Sort key for "m<count>-<timestamp>" ids — string order would put m10 before m2."""
@@ -682,7 +775,8 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Funding not found")
         f = self.fundings[funding_id]
         return {"id": f.id, "market_id": f.market_id, "funder": format(f.funder, "x"),
-                "amount": int(f.amount), "refunded": f.refunded}
+                "amount": int(f.amount), "refunded": f.refunded,
+                "refund_status": f.refund_status}
 
     @gl.public.view
     def get_market_fundings(self, market_id: str) -> typing.Any:

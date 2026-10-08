@@ -780,7 +780,16 @@ def test_fund_market_records_entitlement_and_void_recovers(
     contract.void_market(mid)
     direct_vm.sender = direct_alice
     assert int(contract.refund_funding(fids[0])) == 500
+    # Not consumed before delivery: `refunded` stays False until confirmed.
+    assert contract.get_funding(fids[0])["refunded"] is False
+    assert contract.get_funding(fids[0])["refund_status"] == "attempted"
+    with direct_vm.expect_revert("Refund already requested"):
+        contract.refund_funding(fids[0])
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_funding_refund(fids[0])
+    assert contract.confirm_funding_refund(fids[0]) is True
     assert contract.get_funding(fids[0])["refunded"] is True
+    assert contract.get_funding(fids[0])["refund_status"] == "delivered"
     with direct_vm.expect_revert("Already refunded"):
         contract.refund_funding(fids[0])
 
@@ -806,6 +815,46 @@ def test_fund_market_void_outcome_resolution_recovers(
     _past_dispute_window(direct_vm)
     direct_vm.sender = direct_alice
     assert int(contract.refund_funding(fids[0])) == 700
+
+
+def test_failed_funding_refund_retry_replays(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 600
+    contract.fund_market(mid)
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+
+    emitted = _capture_transfers(direct_vm)
+    direct_vm.sender = direct_alice
+    assert int(contract.refund_funding(fids[0])) == 600
+    assert contract.get_funding(fids[0])["refunded"] is False
+    assert contract.get_funding(fids[0])["refund_status"] == "attempted"
+    assert len(emitted) == 1 and int(emitted[0]["value"]) == 600
+
+    # Retry without a reported delivery failure is rejected: no duplicate emission.
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_funding_refund(fids[0])
+
+    # Delivery never landed -> failure attested -> exactly one recovery transfer.
+    assert contract.report_failed_funding_refund(fids[0]) is True
+    assert int(contract.retry_funding_refund(fids[0])) == 600
+    assert contract.get_funding(fids[0])["refund_status"] == "recovered"
+    assert len(emitted) == 2 and int(emitted[1]["value"]) == 600
+
+    # After recovery is confirmed delivered, the entitlement is fully consumed.
+    assert contract.confirm_funding_refund(fids[0]) is True
+    assert contract.get_funding(fids[0])["refunded"] is True
+    with direct_vm.expect_revert("Already refunded"):
+        contract.refund_funding(fids[0])
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_funding_refund(fids[0])
 
 
 def test_refund_funding_rejects_non_funder(
@@ -849,15 +898,35 @@ def test_failed_payout_keeps_entitlement_and_retry_replays(
     assert payout == 985
     b = contract.get_bet(bid)
     assert b["claimed"] is True and b["payout"] == 985
+    assert b["payout_status"] == "attempted"
     assert len(_payouts_to(emitted, direct_alice)) == 1
     assert int(_payouts_to(emitted, direct_alice)[0]["value"]) == 985
 
-    # The async transfer never landed (no delivery confirmed). The entitlement
-    # is still on the bet, so the bettor can replay it instead of losing it.
-    direct_vm.sender = direct_alice
+    # Without a recorded delivery failure there is nothing to retry: replaying
+    # the transfer must be rejected, not silently re-emitted.
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_payout(bid)
+
+    # The async transfer never landed — the bettor attests to the failure,
+    # and only then may the recorded entitlement be re-emitted exactly once.
+    assert contract.report_failed_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "failed"
     assert int(contract.retry_payout(bid)) == 985
+    assert contract.get_bet(bid)["payout_status"] == "recovered"
     assert len(_payouts_to(emitted, direct_alice)) == 2
     assert int(_payouts_to(emitted, direct_alice)[1]["value"]) == 985
+
+    # A recovered transfer is not re-retryable until another failure is reported.
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_payout(bid)
+
+    # Once delivery is confirmed the entitlement is locked against replays.
+    assert contract.confirm_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "delivered"
+    with direct_vm.expect_revert("No unconfirmed payout to report"):
+        contract.report_failed_payout(bid)
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_payout(bid)
     with direct_vm.expect_revert("Already claimed"):
         contract.claim_winnings(bid)
 
@@ -879,9 +948,26 @@ def test_failed_refund_retry_replays(
     direct_vm.sender = direct_alice
     assert contract.refund_void(bid) is True
     assert contract.get_bet(bid)["payout"] == 1200
+    assert contract.get_bet(bid)["payout_status"] == "attempted"
     assert len(emitted) == 1 and int(emitted[0]["value"]) == 1200
-    direct_vm.sender = direct_alice
+
+    # No failure reported yet -> retry is rejected (no duplicate emission).
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_refund(bid)
+
+    # Bettor attests non-delivery; exactly one recovery transfer is emitted.
+    assert contract.report_failed_payout(bid) is True
     assert int(contract.retry_refund(bid)) == 1200
+    assert contract.get_bet(bid)["payout_status"] == "recovered"
     assert len(emitted) == 2 and int(emitted[1]["value"]) == 1200
+
+    # A second retry without a fresh failure report is rejected.
+    with direct_vm.expect_revert("Prior delivery not marked failed"):
+        contract.retry_refund(bid)
+
+    # Confirming delivery locks the entitlement for good.
+    assert contract.confirm_payout(bid) is True
+    with direct_vm.expect_revert("No unconfirmed payout to report"):
+        contract.report_failed_payout(bid)
     with direct_vm.expect_revert("Already claimed"):
         contract.refund_void(bid)

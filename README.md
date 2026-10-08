@@ -229,15 +229,15 @@ React **19** + TypeScript + **Vite** + **Tailwind CSS 4** + **react-router-dom 7
 **Environment** (`frontend/.env.example`):
 
 ```
-VITE_CONTRACT_ADDRESS=0x33Ed37412426cD584ECC1D1f32b113772c6CBAa4
+VITE_CONTRACT_ADDRESS=0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc
 VITE_NETWORK=studionet
 VITE_RPC_URL=            # optional absolute URL or "direct"
 VITE_SEED_MARKETS=       # optional comma-separated market ids
 ```
 
-**Deployed contract:** [`0x33Ed37412426cD584ECC1D1f32b113772c6CBAa4`](https://explorer-studio.genlayer.com/address/0x33Ed37412426cD584ECC1D1f32b113772c6CBAa4) on **GenLayer Studio** (chain id 61999).
+**Deployed contract:** [`0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc`](https://explorer-studio.genlayer.com/address/0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc) on **GenLayer Studio** (chain id 61999).
 
-> Deploy tx [`0x4752320e…9073ed`](https://explorer-studio.genlayer.com/tx/0x4752320e85b2661ce52bf4022ae2a887a4db3b6db958201c9c1c24f6f59073ed) → `FINALIZED / SUCCESS`. This address replaces the earlier `0x5809…AC60` deployment, which predates the payout gate; it starts empty, so markets must be created (or re-seeded) on the new instance.
+> Official new deployment — [import into Studio](https://studio.genlayer.com/?import-contract=0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc). It replaces the earlier `0x33Ed…CBAa4` instance; it starts empty, so markets must be created (or re-seeded) on the new contract.
 
 ---
 

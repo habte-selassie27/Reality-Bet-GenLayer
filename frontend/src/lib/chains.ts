@@ -35,7 +35,7 @@ export function parseNetwork(v: string | undefined): NetworkKey {
 
 export const CONTRACT_ADDRESS: string =
   import.meta.env.VITE_CONTRACT_ADDRESS ??
-  "0x33Ed37412426cD584ECC1D1f32b113772c6CBAa4";
+  "0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc";
 
 export const DEFAULT_NETWORK: NetworkKey = parseNetwork(import.meta.env.VITE_NETWORK);
 

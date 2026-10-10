@@ -146,12 +146,16 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 | `place_bet(market_id, side)` *(payable)* | anyone before close | Stake GEN on `yes` or `no`; updates pools + `total_volume` |
 | `claim_winnings(bet_id)` | bettor | Payout once the outcome is **finalized** (win / void refund / 0) |
 | `refund_void(bet_id)` | bettor | Full refund on a `VOIDED` market |
-| `retry_payout(bet_id)` | bettor | Re-emit the recorded payout — only after a delivery failure is explicitly reported |
-| `retry_refund(bet_id)` | bettor | Re-emit a voided-market refund — only after a delivery failure is explicitly reported |
-| `report_failed_payout(bet_id)` / `confirm_payout(bet_id)` | bettor / owner | Attest the delivery outcome of a payout or refund transfer |
+| `report_failed_payout(bet_id)` (= `request_recovery`) | bettor / owner | Report non-delivery of a payout/refund transfer — **moves no money**, only flags the entitlement for owner review |
+| `authorize_recovery(bet_id, authorized)` | owner | After independently verifying non-delivery (explorer / ledger balance): grant or deny the recovery. Grant marks `failed` + `authorized`; deny returns to `attempted` (late delivery can be confirmed) |
+| `recover_payout(bet_id)` | bettor | Re-emit the recorded payout — only while `authorized` is set; the authorization is consumed by that single emit |
+| `recover_refund(bet_id)` | bettor | Re-emit a voided-market refund — same owner-authorization gate |
+| `confirm_payout(bet_id)` | bettor / owner | Confirm delivery and permanently lock the entitlement |
 | `refund_funding(funding_id)` | funder | Full refund of a `fund_market` deposit when the market is `VOIDED` or resolves `VOID`; entitlement stays unconsumed until delivery is confirmed |
-| `retry_funding_refund(funding_id)` | funder | Re-emit the funding refund if its async transfer never landed (failure reported) |
-| `report_failed_funding_refund(funding_id)` / `confirm_funding_refund(funding_id)` | funder / owner | Attest the funding-refund delivery outcome |
+| `report_failed_funding_refund(funding_id)` (= `request_funding_recovery`) | funder / owner | Report non-delivery of the funding refund — moves no money |
+| `authorize_funding_recovery(funding_id, authorized)` | owner | Owner verification gate for the funding-refund recovery |
+| `recover_funding_refund(funding_id)` | funder | Re-emit the funding refund — only while `authorized` is set |
+| `confirm_funding_refund(funding_id)` | funder / owner | Confirm delivery and lock the refund |
 | `request_resolution(market_id)` | anyone after `resolve_time` | Runs AI `_resolve` on a `LOCKED` market |
 | `force_resolve(market_id, outcome, note)` | owner | Emergency override (`LOCKED/DISPUTED`) |
 | `raise_dispute(market_id, reason)` | bettor ≤24h post-resolution | `RESOLVED → DISPUTED` |
@@ -162,7 +166,18 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 
 ### Entitlement / recovery records
 
-`fund_market` records a `Funding` (id, market, funder, amount, refunded) per deposit and joins the amount to the pools, so liquidity is never an anonymous, unrecoverable transfer. `Bet.payout` stores the exact amount emitted at claim/refund time; `retry_payout` / `retry_refund` replay it only after a failure is attested via `report_failed_payout`, and `confirm_payout` locks the entitlement once delivery succeeds. Every payout/refund transfer runs through a delivery state machine (`attempted → failed → recovered`, or `attempted → delivered`), so a retry can never double-emit a transfer that was never marked failed. `refund_funding` emits the refund but leaves `refunded` false until `confirm_funding_refund` attests delivery; `retry_funding_refund` recovers a failed funding transfer.
+`fund_market` records a `Funding` (id, market, funder, amount, refunded) per deposit and joins the amount to the pools, so liquidity is never an anonymous, unrecoverable transfer. `Bet.payout` stores the exact amount emitted at claim/refund time, so a transfer that never landed is recoverable instead of lost.
+
+**Recovery is a two-party protocol.** The contract cannot observe the EVM layer where external transfers execute, so no participant — including the payee — may re-emit a transfer on their own word:
+
+```
+attempted ──report_failed_payout (payee, moves no money)──► recovery_requested
+recovery_requested ──authorize_recovery (owner, verified)──► failed + authorized
+failed ──recover_payout (exactly one emit)──► recovered        [authorization spent]
+any non-delivered state ──confirm_payout──► delivered         [permanently locked]
+```
+
+A payee's failure report can never trigger a second payout or refund by itself: re-emission is possible only after the owner has independently verified non-delivery (explorer or ledger balance) and authorized it on-chain, and each authorization is consumed by the single recovery emit it unlocks. A genuinely double-failed transfer simply runs the cycle again — every re-emission stays owner-verified, so there is no cap that strands funds and no path a lying payee can drive alone. `refund_funding` leaves `refunded` false until `confirm_funding_refund` attests delivery; the same two-party gate covers `recover_funding_refund`.
 
 ### View methods
 
@@ -314,7 +329,7 @@ Requires an environment where the `genlayer-test` pytest plugin is active (e.g. 
 - `get_market_bets_detailed` ordering
 - `get_bettor_bets` 0x / bare-hex address regression
 - Liquidity entitlements: `fund_market` records a `Funding`, rejected pre-void, full refund on `VOIDED` and on VOID-outcome resolution, non-funder revert
-- Failed async payouts: recorded `Bet.payout` survives a lost transfer; `report_failed_payout` + `retry_payout` / `retry_refund` recover it exactly once, and `confirm_payout` permanently locks delivered transfers
+- Failed async payouts: recorded `Bet.payout` survives a lost transfer; recovery is two-party — the payee's `report_failed_payout` only requests, the owner's `authorize_recovery` (after independent verification) is what enables exactly one `recover_payout` / `recover_refund` / `recover_funding_refund` emit, and `confirm_payout` permanently locks delivered transfers
 
 > Note: direct mode runs the **leader only**; full validator consensus runs on-chain.
 

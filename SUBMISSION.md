@@ -2,10 +2,10 @@
 
 Title: RealityBet — AI-Resolved Prediction Market
 
-Decentralized YES/NO prediction market settled by GenLayer validator consensus over live web data. Create markets, bet GEN, lock, AI-resolve, claim or dispute within 24h.
+AI-resolved YES/NO prediction market on GenLayer: create markets, bet GEN, lock, LLM-resolve via live web, claim/dispute ≤24h.
 
-Consensus: resolver uses gl.eq_principle.prompt_comparative — leader fetches resolution_url + LLM JSON {outcome,confidence,reason,sources}; validators re-fetch/re-run and match `outcome` exactly via EqComparative template. No strict_eq on LLM text, no schema-only validation. Low-confidence/parse-fail auto-voids; confidence+sources stored on-chain for UI; payouts are parimutuel u256 math with fee split via emit_transfer.
+Consensus: gl.eq_principle.prompt_comparative — leader fetches resolution_url, returns LLM JSON {outcome,confidence,reason,sources}; validators re-fetch, match `outcome` exactly. Low-confidence/parse-fail auto-voids.
 
-Non-trivial: full lifecycle (open/locked/resolved/finalized/voided/disputed), TreeMap/DynArray storage, payable pools, dispute + re_resolve + force_resolve, defensive LLM parsing, 25 direct tests with mocked web/LLM, lint-clean.
+Non-trivial: full lifecycle (open/locked/resolved/finalized/voided/disputed), TreeMap/DynArray storage, payable pools, dispute/re_resolve/force_resolve, 36 tests.
 
-Payout safety: `resolved` is not `finalized` — claims revert until the 24h dispute window closes (`finalize_market`, permissionless) or a raised dispute is finally resolved, and the outcome is frozen from the first payout, so no market can pay twice or pay the wrong side. `get_market` exposes `finalized` / `claims_open` / `dispute_deadline`.
+Safety (per review): claims unlock only after the 24h window, no market pays twice. Recovery is two-party: `report_failed_payout` only requests — moves no money; owner must independently verify non-delivery and `authorize_recovery` on-chain; each authorization is spent by one `recover_payout`/`recover_refund`/`recover_funding_refund` emit; `confirm_payout` locks delivered transfers. Self-reported failure never mints a second payout.

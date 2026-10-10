@@ -785,8 +785,9 @@ def test_fund_market_records_entitlement_and_void_recovers(
     assert contract.get_funding(fids[0])["refund_status"] == "attempted"
     with direct_vm.expect_revert("Refund already requested"):
         contract.refund_funding(fids[0])
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_funding_refund(fids[0])
+    # Recovery without a request + owner authorization is rejected.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
     assert contract.confirm_funding_refund(fids[0]) is True
     assert contract.get_funding(fids[0])["refunded"] is True
     assert contract.get_funding(fids[0])["refund_status"] == "delivered"
@@ -817,7 +818,7 @@ def test_fund_market_void_outcome_resolution_recovers(
     assert int(contract.refund_funding(fids[0])) == 700
 
 
-def test_failed_funding_refund_retry_replays(
+def test_failed_funding_refund_recovery_is_owner_gated(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
     direct_vm.sender = direct_owner
@@ -838,23 +839,78 @@ def test_failed_funding_refund_retry_replays(
     assert contract.get_funding(fids[0])["refund_status"] == "attempted"
     assert len(emitted) == 1 and int(emitted[0]["value"]) == 600
 
-    # Retry without a reported delivery failure is rejected: no duplicate emission.
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_funding_refund(fids[0])
-
-    # Delivery never landed -> failure attested -> exactly one recovery transfer.
+    # A funder's own failure report moves no money: it only requests recovery.
     assert contract.report_failed_funding_refund(fids[0]) is True
-    assert int(contract.retry_funding_refund(fids[0])) == 600
+    assert contract.get_funding(fids[0])["refund_status"] == "recovery_requested"
+    assert len(emitted) == 1
+
+    # Recovery without the owner's on-chain authorization is rejected —
+    # self-reported non-delivery can never trigger a re-emission.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+    assert len(emitted) == 1
+
+    # The owner separately verifies non-delivery (explorer/ledger balance)
+    # and authorizes on-chain; the funder then gets exactly one recovery emit.
+    direct_vm.sender = direct_owner
+    assert contract.authorize_funding_recovery(fids[0], True) is True
+    assert contract.get_funding(fids[0])["refund_status"] == "failed"
+    assert contract.get_funding(fids[0])["authorized"] is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_funding_refund(fids[0])) == 600
     assert contract.get_funding(fids[0])["refund_status"] == "recovered"
+    assert contract.get_funding(fids[0])["authorized"] is False  # spent
     assert len(emitted) == 2 and int(emitted[1]["value"]) == 600
 
-    # After recovery is confirmed delivered, the entitlement is fully consumed.
+    # The authorization is consumed: a second recovery is impossible even if
+    # a "failed" status were left over, and nothing reopens without a fresh
+    # owner gate.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+    assert len(emitted) == 2
+
+    # After delivery is confirmed the entitlement is fully consumed.
     assert contract.confirm_funding_refund(fids[0]) is True
     assert contract.get_funding(fids[0])["refunded"] is True
     with direct_vm.expect_revert("Already refunded"):
         contract.refund_funding(fids[0])
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_funding_refund(fids[0])
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+
+
+def test_owner_denial_returns_refund_to_attempted(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """The owner's deny is also an independent verification: "the transfer did
+    land" — and it reopens exactly the confirm-late-delivery path, nothing else."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract.fund_market(mid)
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+    direct_vm.sender = direct_alice
+    contract.refund_funding(fids[0])
+    contract.report_failed_funding_refund(fids[0])
+
+    direct_vm.sender = direct_owner
+    # Deny = "I verified the refund DID land" → back to attempted.
+    assert contract.authorize_funding_recovery(fids[0], False) is True
+    assert contract.get_funding(fids[0])["refund_status"] == "attempted"
+    assert contract.get_funding(fids[0])["authorized"] is False
+
+    # Denial authorizes nothing: recovery is still impossible.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+
+    # ...but confirming a late delivery now works again.
+    assert contract.confirm_funding_refund(fids[0]) is True
+    assert contract.get_funding(fids[0])["refunded"] is True
 
 
 def test_refund_funding_rejects_non_funder(
@@ -875,9 +931,16 @@ def test_refund_funding_rejects_non_funder(
         contract.refund_funding(fids[0])
 
 
-def test_failed_payout_keeps_entitlement_and_retry_replays(
+def test_failed_payout_recovery_is_owner_gated(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
+    """A self-reported delivery failure can never trigger a second payout.
+
+    The bettor's report only *requests* recovery; the recorded entitlement is
+    re-emitted solely after the owner independently verifies non-delivery
+    (explorer/ledger balance) and authorizes it on-chain — and each
+    authorization is spent by exactly one recovery transfer.
+    """
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
     mid = _setup_open_market(direct_vm, contract)
@@ -902,39 +965,87 @@ def test_failed_payout_keeps_entitlement_and_retry_replays(
     assert len(_payouts_to(emitted, direct_alice)) == 1
     assert int(_payouts_to(emitted, direct_alice)[0]["value"]) == 985
 
-    # Without a recorded delivery failure there is nothing to retry: replaying
-    # the transfer must be rejected, not silently re-emitted.
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_payout(bid)
+    # With no failure reported there is no recovery request: re-emission is
+    # rejected, not silently allowed.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
 
-    # The async transfer never landed — the bettor attests to the failure,
-    # and only then may the recorded entitlement be re-emitted exactly once.
+    # The bettor attests non-delivery — this moves NO money, it only flags
+    # the entitlement as recovery_requested so the owner can review it.
     assert contract.report_failed_payout(bid) is True
-    assert contract.get_bet(bid)["payout_status"] == "failed"
-    assert int(contract.retry_payout(bid)) == 985
-    assert contract.get_bet(bid)["payout_status"] == "recovered"
+    assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
+    assert len(_payouts_to(emitted, direct_alice)) == 1  # nothing re-emitted
+
+    # Recovery still rejected without the owner's separate authorization.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # The owner independently verifies non-delivery, then authorizes on-chain.
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
+    b = contract.get_bet(bid)
+    assert b["payout_status"] == "failed"
+    assert b["authorized"] is True
+
+    # Now — and only now — the recorded entitlement is re-emitted exactly once.
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_payout(bid)) == 985
+    b = contract.get_bet(bid)
+    assert b["payout_status"] == "recovered"
+    assert b["authorized"] is False  # authorization consumed by that one emit
     assert len(_payouts_to(emitted, direct_alice)) == 2
     assert int(_payouts_to(emitted, direct_alice)[1]["value"]) == 985
 
-    # A recovered transfer is not re-retryable, and with the retry budget spent
-    # no fresh failure report can reopen the cycle either.
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_payout(bid)
+    # The spent authorization cannot be reused: a second recovery is rejected
+    # even though the transfer is in "recovered".
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 2
 
     # Once delivery is confirmed the entitlement is locked against replays.
     assert contract.confirm_payout(bid) is True
     assert contract.get_bet(bid)["payout_status"] == "delivered"
     with direct_vm.expect_revert("No unconfirmed payout to report"):
         contract.report_failed_payout(bid)
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_payout(bid)
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
     with direct_vm.expect_revert("Already claimed"):
         contract.claim_winnings(bid)
 
 
-def test_failed_refund_retry_replays(
+def test_owner_cannot_authorize_without_a_request(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
+    """The authorization gate is never a bypass: it only decides a *pending*
+    payee request, so the owner cannot authorize a transfer nobody reported —
+    and cannot unilaterally re-open an attempted transfer either."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 900
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
+    direct_vm.sender = direct_alice
+    contract.claim_winnings(bid)  # attempted, no request filed
+
+    # Owner cannot authorize a recovery that was never requested.
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("No recovery requested for this payout"):
+        contract.authorize_recovery(bid, True)
+
+
+def test_failed_refund_recovery_is_owner_gated(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """Same two-party gate on the voided-market refund path."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
     mid = _setup_open_market(direct_vm, contract)
@@ -952,19 +1063,29 @@ def test_failed_refund_retry_replays(
     assert contract.get_bet(bid)["payout_status"] == "attempted"
     assert len(emitted) == 1 and int(emitted[0]["value"]) == 1200
 
-    # No failure reported yet -> retry is rejected (no duplicate emission).
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_refund(bid)
-
-    # Bettor attests non-delivery; exactly one recovery transfer is emitted.
+    # The bettor's report only requests recovery — no transfer is re-emitted.
     assert contract.report_failed_payout(bid) is True
-    assert int(contract.retry_refund(bid)) == 1200
+    assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
+    assert len(emitted) == 1
+
+    # Without the owner's authorization there is no recovery emit.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_refund(bid)
+    assert len(emitted) == 1
+
+    # The owner verifies non-delivery and authorizes; exactly one re-emission.
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_refund(bid)) == 1200
     assert contract.get_bet(bid)["payout_status"] == "recovered"
+    assert contract.get_bet(bid)["authorized"] is False
     assert len(emitted) == 2 and int(emitted[1]["value"]) == 1200
 
-    # A second retry without a fresh failure report is rejected.
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_refund(bid)
+    # The spent authorization cannot be reused.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_refund(bid)
+    assert len(emitted) == 2
 
     # Confirming delivery locks the entitlement for good.
     assert contract.confirm_payout(bid) is True
@@ -974,20 +1095,13 @@ def test_failed_refund_retry_replays(
         contract.refund_void(bid)
 
 
-def test_retry_cap_blocks_second_attestation_cycle(
+def test_payee_cannot_self_authorized_recovery_on_any_path(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """A payee cannot loop report_failed → retry: the budget is MAX_RETRIES.
-
-    The first attestation cycle is honored (exactly one recovery transfer per
-    entitlement), but once retry_count reaches the cap a second failure report
-    is refused — and with it any further re-emission. Covered for the payout,
-    voided-market refund, and funding refund paths.
-
-    This cap binds the payee only; the owner's countersign escape hatch for a
-    genuinely double-failed transfer is covered by
-    test_owner_countersign_unblocks_double_failed_payout / _refunds.
-    """
+    """Fraud matrix: no payee-only action sequence on any of the three transfer
+    paths can produce more than the original single emission. Every re-emission
+    requires an owner authorization that only verifies non-delivery — modeled
+    here as the owner's on-chain decision after the payee request."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
     emitted = _capture_transfers(direct_vm)
@@ -1007,21 +1121,43 @@ def test_retry_cap_blocks_second_attestation_cycle(
 
     direct_vm.sender = direct_alice
     assert int(contract.claim_winnings(bid)) == 985
-    assert contract.report_failed_payout(bid) is True
-    assert int(contract.retry_payout(bid)) == 985  # first cycle honored
-    assert contract.get_bet(bid)["retry_count"] == 1
-    assert contract.get_bet(bid)["payout_status"] == "recovered"
-    assert len(_payouts_to(emitted, direct_alice)) == 2
 
-    # Second attestation cycle: refused at the report, so no retry can follow.
-    # (The retry call itself is rejected by the status gate — a capped report
-    # can never set "failed" again — but either way no transfer is emitted.)
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_payout(bid)
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_payout(bid)
-    assert len(_payouts_to(emitted, direct_alice)) == 2  # no third emission
-    assert contract.get_bet(bid)["payout_status"] == "recovered"
+    # The entire payee-only toolset can never move a second transfer: a
+    # report only flags recovery_requested (repeat reports revert), recovery
+    # without authorization reverts, and the payee cannot self-authorize.
+    assert contract.report_failed_payout(bid) is True
+    with direct_vm.expect_revert("No unconfirmed payout to report"):
+        contract.report_failed_payout(bid)  # already requested
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    with direct_vm.expect_revert("Only owner"):
+        contract.authorize_recovery(bid, True)  # payee can't self-authorize
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
+
+    # ...and the owner, exercising independent verification, can unlock the
+    # single recovery the report requested. The authorization is then spent.
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_payout(bid)) == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 2
+    assert contract.get_bet(bid)["authorized"] is False
+
+    # A second cycle needs a NEW report AND a NEW owner verification, one
+    # authorization per re-emitted transfer — never a runaway replay loop.
+    assert contract.report_failed_payout(bid) is True
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_payout(bid)) == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 3
+    # ...and the same spent-authorization rule still binds afterwards.
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 3
 
     # ── voided-market refund path ─────────────────────────────────
     direct_vm.warp("2025-01-03T00:00:00Z")
@@ -1035,14 +1171,23 @@ def test_retry_cap_blocks_second_attestation_cycle(
     contract.void_market(mid2)
     direct_vm.sender = direct_alice
     assert contract.refund_void(bid2) is True
+
+    # Payee-only sequence: report and recover all rejected. (Count includes
+    # the refund's original emission, so 4 right now.)
     assert contract.report_failed_payout(bid2) is True
-    assert int(contract.retry_refund(bid2)) == 800
-    assert contract.get_bet(bid2)["retry_count"] == 1
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_payout(bid2)
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_refund(bid2)
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_refund(bid2)
     assert len(_payouts_to(emitted, direct_alice)) == 4
+
+    # The report is honored only after the owner verifies non-delivery.
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid2, True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_refund(bid2)) == 800
+    assert contract.get_bet(bid2)["authorized"] is False
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_refund(bid2)
+    assert len(_payouts_to(emitted, direct_alice)) == 5
 
     # ── funding refund path ───────────────────────────────────────
     direct_vm.warp("2025-01-05T00:00:00Z")
@@ -1058,13 +1203,16 @@ def test_retry_cap_blocks_second_attestation_cycle(
     direct_vm.sender = direct_alice
     assert int(contract.refund_funding(fids[0])) == 300
     assert contract.report_failed_funding_refund(fids[0]) is True
-    assert int(contract.retry_funding_refund(fids[0])) == 300
-    assert contract.get_funding(fids[0])["retry_count"] == 1
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_funding_refund(fids[0])
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_funding_refund(fids[0])
-    assert len(_payouts_to(emitted, direct_alice)) == 6
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+    direct_vm.sender = direct_owner
+    assert contract.authorize_funding_recovery(fids[0], True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_funding_refund(fids[0])) == 300
+    assert contract.get_funding(fids[0])["authorized"] is False
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+    assert len(_payouts_to(emitted, direct_alice)) == 7
 
     # The market outcome itself is untouched by all of this.
     assert contract.get_market(mid)["outcome"] == "yes"
@@ -1072,15 +1220,16 @@ def test_retry_cap_blocks_second_attestation_cycle(
     assert contract.get_market(mid3)["status"] == "voided"
 
 
-def test_owner_countersign_unblocks_double_failed_payout(
+def test_owner_authorization_gates_every_recovery(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """A transfer that fails twice must not be stranded at the retry cap.
+    """The two-party protocol in full: payee request, owner verification,
+    single re-emission, repeatable only through the same gate.
 
-    After one report→retry cycle retry_count is spent, so the payee's second
-    failure report is refused. The owner may countersign that report instead,
-    which records the failure and authorizes exactly one more re-emission —
-    spent by the retry itself, so the payee still cannot reopen the loop alone.
+    A transfer that fails twice is never stranded: the owner simply authorizes
+    a second cycle after verifying the second failure too. What no payee can
+    ever do is shortcut the gate — which is why no self-reported failure can
+    mint a second payout or refund.
     """
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
@@ -1098,73 +1247,76 @@ def test_owner_countersign_unblocks_double_failed_payout(
     contract.request_resolution(mid)
     _past_dispute_window(direct_vm)
 
-    # Attempt 1 fails → report → retry emits attempt 2, which fails too.
+    # Attempt 1 fails → payee report (request only) → owner verifies and
+    # authorizes → recovery emits attempt 2, which fails too.
     direct_vm.sender = direct_alice
     assert int(contract.claim_winnings(bid)) == 985
     assert contract.report_failed_payout(bid) is True
-    assert int(contract.retry_payout(bid)) == 985
-    assert contract.get_bet(bid)["retry_count"] == 1
+    assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_payout(bid)) == 985          # attempt 2
     assert contract.get_bet(bid)["payout_status"] == "recovered"
-    assert contract.get_bet(bid)["countersigned"] is False
+    assert contract.get_bet(bid)["authorized"] is False      # spent
     assert len(_payouts_to(emitted, direct_alice)) == 2
 
-    # Double-failed: the payee's own second report is refused at the cap...
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_payout(bid)
-
-    # ...but the owner countersigns it, which is what unsticks the transfer.
-    direct_vm.sender = direct_owner
+    # Double-failed: the payee reports again, but the report alone still moves
+    # nothing — recovery stays gated.
     assert contract.report_failed_payout(bid) is True
-    assert contract.get_bet(bid)["payout_status"] == "failed"
-    assert contract.get_bet(bid)["countersigned"] is True
+    assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 2
 
+    # The owner verifies the second failure and authorizes again.
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
     direct_vm.sender = direct_alice
-    assert int(contract.retry_payout(bid)) == 985            # attempt 3
-    assert contract.get_bet(bid)["retry_count"] == 2
+    assert int(contract.recover_payout(bid)) == 985          # attempt 3
     assert contract.get_bet(bid)["payout_status"] == "recovered"
-    assert contract.get_bet(bid)["countersigned"] is False   # countersign spent
+    assert contract.get_bet(bid)["authorized"] is False
     assert len(_payouts_to(emitted, direct_alice)) == 3
 
-    # The cap still binds the payee: no loop without a fresh owner countersign.
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_payout(bid)
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_payout(bid)
-    assert len(_payouts_to(emitted, direct_alice)) == 3
-
-    # Each further failure needs (and gets) its own countersign — never stuck.
-    direct_vm.sender = direct_owner
+    # Each further failure needs a fresh request plus a fresh owner
+    # verification — never stuck, never self-serve.
     assert contract.report_failed_payout(bid) is True
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
     direct_vm.sender = direct_alice
-    assert int(contract.retry_payout(bid)) == 985            # attempt 4
-    assert contract.get_bet(bid)["countersigned"] is False
+    assert int(contract.recover_payout(bid)) == 985          # attempt 4
     assert len(_payouts_to(emitted, direct_alice)) == 4
 
-    # Confirming delivery still closes the entitlement for good, countersign
-    # included — no owner path can re-open a delivered transfer.
+    # Confirming delivery still closes the entitlement for good — no owner
+    # path or payee report can ever re-open a delivered transfer.
     assert contract.confirm_payout(bid) is True
     assert contract.get_bet(bid)["payout_status"] == "delivered"
     direct_vm.sender = direct_owner
     with direct_vm.expect_revert("No unconfirmed payout to report"):
         contract.report_failed_payout(bid)
+    with direct_vm.expect_revert("No recovery requested for this payout"):
+        contract.authorize_recovery(bid, True)
     direct_vm.sender = direct_alice
     with direct_vm.expect_revert("No unconfirmed payout to report"):
         contract.report_failed_payout(bid)
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_payout(bid)
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
 
 
-def test_owner_countersign_unblocks_double_failed_refunds(
+def test_owner_authorization_gates_refunds_too(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """The same escape hatch on the other two transfer paths: a voided-market
-    refund and a funding refund that each fail twice are unstuck by an owner
-    countersign, while the payee stays capped on their own."""
+    """The same two-party protocol on the other two transfer paths: a
+    voided-market refund and a funding refund that each fail twice are never
+    stranded (the owner re-authorizes after each verified failure), while the
+    payee alone can never move money past the original emit."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
     emitted = _capture_transfers(direct_vm)
 
-    # ── voided-market refund path (retry_refund) ──────────────────
+    # ── voided-market refund path (recover_refund) ───────────────
     direct_vm.warp("2025-01-01T00:00:00Z")
     now = _ts("2025-01-01T00:00:00Z")
     mid = _make_market(contract, now + 1000, now + 2000)
@@ -1177,18 +1329,20 @@ def test_owner_countersign_unblocks_double_failed_refunds(
 
     direct_vm.sender = direct_alice
     assert contract.refund_void(bid) is True                  # attempt 1
-    assert contract.report_failed_payout(bid) is True
-    assert int(contract.retry_refund(bid)) == 800             # attempt 2
-    assert contract.get_bet(bid)["retry_count"] == 1
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_payout(bid)
-
-    direct_vm.sender = direct_owner                            # owner countersign
-    assert contract.report_failed_payout(bid) is True
+    assert contract.report_failed_payout(bid) is True         # request only
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
     direct_vm.sender = direct_alice
-    assert int(contract.retry_refund(bid)) == 800             # attempt 3
-    assert contract.get_bet(bid)["retry_count"] == 2
-    assert contract.get_bet(bid)["countersigned"] is False
+    assert int(contract.recover_refund(bid)) == 800           # attempt 2
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_refund(bid)
+
+    # Second failure: request again, owner verifies and authorizes again.
+    assert contract.report_failed_payout(bid) is True
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid, True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_refund(bid)) == 800           # attempt 3
     assert len(_payouts_to(emitted, direct_alice)) == 3
 
     # ── funding refund path (report_failed_funding_refund) ───────
@@ -1206,24 +1360,26 @@ def test_owner_countersign_unblocks_double_failed_refunds(
     direct_vm.sender = direct_alice
     assert int(contract.refund_funding(fids[0])) == 300       # attempt 1
     assert contract.report_failed_funding_refund(fids[0]) is True
-    assert int(contract.retry_funding_refund(fids[0])) == 300  # attempt 2
-    assert contract.get_funding(fids[0])["retry_count"] == 1
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_funding_refund(fids[0])
-
-    direct_vm.sender = direct_owner                            # owner countersign
-    assert contract.report_failed_funding_refund(fids[0]) is True
-    assert contract.get_funding(fids[0])["countersigned"] is True
+    direct_vm.sender = direct_owner
+    assert contract.authorize_funding_recovery(fids[0], True) is True
     direct_vm.sender = direct_alice
-    assert int(contract.retry_funding_refund(fids[0])) == 300  # attempt 3
-    assert contract.get_funding(fids[0])["retry_count"] == 2
+    assert int(contract.recover_funding_refund(fids[0])) == 300  # attempt 2
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+
+    # Second failure: request again, owner verifies and authorizes again.
+    assert contract.report_failed_funding_refund(fids[0]) is True
+    direct_vm.sender = direct_owner
+    assert contract.authorize_funding_recovery(fids[0], True) is True
+    direct_vm.sender = direct_alice
+    assert int(contract.recover_funding_refund(fids[0])) == 300  # attempt 3
     assert contract.get_funding(fids[0])["refund_status"] == "recovered"
-    assert contract.get_funding(fids[0])["countersigned"] is False
     assert len(_payouts_to(emitted, direct_alice)) == 6
 
-    # The funder alone is still capped — the countersign is owner-only.
-    with direct_vm.expect_revert("Retry limit reached"):
-        contract.report_failed_funding_refund(fids[0])
-    with direct_vm.expect_revert("Prior delivery not marked failed"):
-        contract.retry_funding_refund(fids[0])
+    # The funder alone still cannot authorize — the gate is owner-only.
+    assert contract.report_failed_funding_refund(fids[0]) is True
+    with direct_vm.expect_revert("Only owner"):
+        contract.authorize_funding_recovery(fids[0], True)
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
     assert len(_payouts_to(emitted, direct_alice)) == 6

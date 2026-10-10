@@ -11,16 +11,24 @@ import typing
 # outcome that is still appealable.
 DISPUTE_WINDOW = 86400
 
-# Maximum number of times a payout/refund transfer may be re-emitted after a
-# reported delivery failure. Each retry consumes one unit of retry_count and
-# failure attestations are refused once the budget is spent, so a payee cannot
-# cycle report_failed → retry indefinitely to re-emit the same entitlement.
-# The cap binds the payee only: once it is spent the owner may countersign a
-# fresh failure report (report_failed_payout / report_failed_funding_refund),
-# which authorizes exactly one further re-emission — so a transfer that failed
-# twice is never stranded with no path forward, while a payee acting alone
-# still cannot reopen the loop.
-MAX_RETRIES = 1
+# Failed-delivery recovery is a two-party protocol. The contract cannot
+# observe the EVM layer where external transfers execute, so no single
+# participant — including the payee — may re-emit a transfer on their own
+# word. A payee can only REQUEST recovery; the owner must then independently
+# verify non-delivery (explorer or ledger balance) and authorize it on-chain.
+# Each authorization is consumed by exactly one recovery transfer, and a
+# confirmed delivery permanently locks the entitlement. The result: a lying
+# payee can never mint themselves a second payout, and a genuinely failed
+# transfer is never stranded as long as the owner acts.
+#
+#   attempted ──request_recovery(payee)──► recovery_requested
+#   recovery_requested ──authorize_recovery(owner)──► failed (+authorized)
+#   failed ──recover_payout()──► recovered   (exactly one transfer)
+#   attempted/recovered/recovery_requested/failed ──confirm_payout()──► delivered
+#
+# A transfer that fails twice simply runs the cycle again; each re-emission
+# still required the owner's fresh authorization, so there is no loop a payee
+# can drive alone — and no retry-count cap is needed to keep the payee honest.
 
 
 class MarketStatus:
@@ -80,27 +88,24 @@ class Bet:
     claimed: bool
     placed_at: u256
     # Recorded at claim/refund time. Persisting the exact payout is what
-    # makes a failed (or never-delivered) transfer recoverable: retry_payout
-    # and retry_refund re-emit this recorded value.
+    # makes a failed (or never-delivered) transfer recoverable:
+    # recover_payout / recover_refund re-emit this recorded value.
     payout: u256
     # Delivery state machine for the payout transfer:
-    #   ""          -> no payout transfer was ever emitted
-    #   "attempted" -> emitted, delivery not yet confirmed
-    #   "failed"    -> payee/owner explicitly reported non-delivery; the
-    #                  entitlement is eligible for exactly one retry
-    #   "recovered" -> a retry transfer was emitted, awaiting delivery
-    #   "delivered" -> delivery confirmed; retries are permanently locked
+    #   ""                  -> no payout transfer was ever emitted
+    #   "attempted"         -> emitted, delivery not yet confirmed
+    #   "recovery_requested"-> payee reported non-delivery; awaiting owner
+    #   "failed"            -> owner authorized recovery after verifying
+    #                          non-delivery; exactly one recovery allowed
+    #   "recovered"         -> a recovery transfer was emitted, awaiting delivery
+    #   "delivered"         -> delivery confirmed; entitlement permanently locked
     payout_status: str
-    # Number of recovery transfers already emitted for this entitlement. Each
-    # retry increments it; once it reaches MAX_RETRIES no further failure
-    # report or retry is accepted — the report→retry cycle is capped.
-    retry_count: u256
-    # Owner countersign: set only by the owner, and only on a failure report
-    # filed after retry_count reached MAX_RETRIES. It authorizes exactly one
-    # extra re-emission and is cleared by that retry, so every transfer beyond
-    # the cap needs a fresh owner approval — the payee can never reopen the
-    # loop alone, but a double-failed transfer is never stuck either.
-    countersigned: bool
+    # Set only by the owner via authorize_recovery after they have
+    # independently verified that the transfer never landed (explorer/ledger
+    # balance). Consumed — reset to False — by the single recovery emit it
+    # unlocks. No payee action can set it, so no payee can re-emit money on
+    # their own word.
+    authorized: bool
 
 
 @allow_storage
@@ -115,11 +120,9 @@ class Funding:
     # only flips once delivery is confirmed — it is never consumed up-front
     # before the async transfer lands.
     refund_status: str
-    # Same retry budget as Bet.retry_count: caps the report→retry cycle.
-    retry_count: u256
-    # Same owner-countersign flag as Bet.countersigned: set only by the owner
-    # on a post-cap failure report, spent by exactly one retry.
-    countersigned: bool
+    # Same owner authorization as Bet.authorized: owner-only, spent by the
+    # single recovery emit it unlocks.
+    authorized: bool
 
 
 @allow_storage
@@ -289,7 +292,7 @@ class RealityBet(gl.Contract):
         # forever.
         fid = "f" + str(int(self.funding_count)) + "-" + str(int(self._now()))
         self.funding_count = u256(int(self.funding_count) + 1)
-        self.fundings[fid] = Funding(fid, market_id, gl.message.sender_address, v, False, "", u256(0), False)
+        self.fundings[fid] = Funding(fid, market_id, gl.message.sender_address, v, False, "", False)
         self.market_fundings.get_or_insert_default(market_id).append(fid)
         return True
 
@@ -310,7 +313,7 @@ class RealityBet(gl.Contract):
         now = self._now()
         bid = "b" + str(int(self.bet_count)) + "-" + str(int(now))
         self.bet_count = u256(int(self.bet_count) + 1)
-        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now, u256(0), "", u256(0), False)
+        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now, u256(0), "", False)
         self.market_bets.get_or_insert_default(market_id).append(bid)
         key = self._addr_key(bettor)
         self.bettor_bets.get_or_insert_default(key).append(bid)
@@ -358,61 +361,92 @@ class RealityBet(gl.Contract):
         if int(payout) > 0:
             # Transfers are async (PostMessage on 'finalized'): they can fail
             # after the state change commits. The recorded b.payout keeps the
-            # entitlement recoverable through retry_payout.
+            # entitlement recoverable through request_recovery +
+            # authorize_recovery + recover_payout.
             gl.get_contract_at(b.bettor).emit_transfer(value=payout)
         return payout
 
     @gl.public.write
-    def retry_payout(self, bet_id: str) -> u256:
-        """Re-emit a previously recorded payout whose transfer never landed."""
+    def request_recovery(self, bet_id: str) -> bool:
+        """Payee reports non-delivery of a payout/refund transfer.
+
+        A report alone moves no money: it only sets the entitlement to
+        recovery_requested and notifies the owner. Re-emission always
+        requires the owner's separate on-chain authorization, which they
+        give only after independently verifying non-delivery.
+        """
+        b = self._get_bet(bet_id)
+        if gl.message.sender_address not in (b.bettor, self.owner):
+            raise gl.vm.UserError("Not authorized")
+        if b.payout_status not in ("attempted", "recovered"):
+            raise gl.vm.UserError("No unconfirmed payout to report")
+        b.payout_status = "recovery_requested"
+        self.bets[bet_id] = b
+        return True
+
+    @gl.public.write
+    def authorize_recovery(self, bet_id: str, authorized: bool) -> bool:
+        """Owner gate for a recovery: the independent proof of non-delivery.
+
+        Only verified non-delivery may be authorized — denying the request
+        returns the entitlement to attempted so the payee can confirm
+        delivery if the transfer shows up late. Either decision is a fresh
+        owner action; the authorization itself is spent by exactly one
+        recovery emit, so every re-emission is backed by a deliberate,
+        verified owner approval and never by the payee's say-so.
+        """
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        b = self._get_bet(bet_id)
+        if b.payout_status != "recovery_requested":
+            raise gl.vm.UserError("No recovery requested for this payout")
+        if authorized:
+            b.payout_status = "failed"
+            b.authorized = True
+        else:
+            # Refusing keeps the transfer's attempted state — the payee can
+            # still confirm a late delivery, or re-request if it truly failed.
+            b.payout_status = "attempted"
+        self.bets[bet_id] = b
+        return True
+
+    @gl.public.write
+    def recover_payout(self, bet_id: str) -> u256:
+        """Re-emit a recorded payout/refund that the owner verified as failed.
+
+        Gated on the owner's authorization — never on a payee's own report —
+        so a self-reported failure can never trigger a second transfer.
+        """
         b = self._get_bet(bet_id)
         m = self._get_market(b.market_id)
         if not b.bettor == gl.message.sender_address:
             raise gl.vm.UserError("Not your bet")
         if not b.claimed:
-            raise gl.vm.UserError("Nothing to retry - claim first")
-        if not m.status == MarketStatus.RESOLVED:
-            raise gl.vm.UserError("Market not resolved")
+            raise gl.vm.UserError("Nothing to recover - claim or refund first")
         if int(b.payout) <= 0:
             raise gl.vm.UserError("No payout recorded for this bet")
-        # Retries are gated on an explicit failure report: re-emitting a
-        # transfer whose delivery was never marked failed would be a double-pay.
-        if b.payout_status != "failed":
-            raise gl.vm.UserError("Prior delivery not marked failed - no retry allowed")
-        # The cap is a payee-side bound: bypassing it requires a fresh owner
-        # countersign on the failure report, which this one retry then spends.
-        if int(b.retry_count) >= MAX_RETRIES and not b.countersigned:
-            raise gl.vm.UserError("Retry limit reached")
+        # Refunds are only valid on the market state that recorded them:
+        # a claim-payout needs the resolved market, a void-refund the voided one.
+        expected = (MarketStatus.VOIDED
+                    if (int(b.payout) == int(b.amount) and m.status == MarketStatus.VOIDED)
+                    else MarketStatus.RESOLVED)
+        if not m.status == expected:
+            raise gl.vm.UserError("Market state does not match recorded payout")
+        # The owner's authorization IS the verified proof of non-delivery.
+        if b.payout_status != "failed" or not b.authorized:
+            raise gl.vm.UserError("Recovery not authorized by owner")
         gl.get_contract_at(b.bettor).emit_transfer(value=b.payout)
-        b.retry_count = u256(int(b.retry_count) + 1)
+        # Spent: exactly one recovery transfer per authorization.
+        b.authorized = False
         b.payout_status = "recovered"
-        b.countersigned = False
         self.bets[bet_id] = b
         return b.payout
 
     @gl.public.write
     def report_failed_payout(self, bet_id: str) -> bool:
-        """Bettor attests non-delivery; past the cap the owner countersigns.
-
-        A payee's own report is refused once retry_count reaches MAX_RETRIES,
-        so they cannot reopen the report→retry loop. The owner's report is the
-        escape hatch for a transfer that genuinely failed twice: it records the
-        failure and countersigns exactly one further re-emission, so the
-        entitlement never strands in "recovered" with no way forward.
-        """
-        b = self._get_bet(bet_id)
-        sender = gl.message.sender_address
-        if sender not in (b.bettor, self.owner):
-            raise gl.vm.UserError("Not authorized")
-        if b.payout_status not in ("attempted", "recovered"):
-            raise gl.vm.UserError("No unconfirmed payout to report")
-        if int(b.retry_count) >= MAX_RETRIES:
-            if not sender == self.owner:
-                raise gl.vm.UserError("Retry limit reached - owner countersign required")
-            b.countersigned = True
-        b.payout_status = "failed"
-        self.bets[bet_id] = b
-        return True
+        """Bettor attests non-delivery. Moves no money on its own — see
+        request_recovery; kept as an alias for the payee-facing flow."""
+        return self.request_recovery(bet_id)
 
     @gl.public.write
     def confirm_payout(self, bet_id: str) -> bool:
@@ -420,7 +454,7 @@ class RealityBet(gl.Contract):
         b = self._get_bet(bet_id)
         if gl.message.sender_address not in (b.bettor, self.owner):
             raise gl.vm.UserError("Not authorized")
-        if b.payout_status not in ("attempted", "recovered"):
+        if b.payout_status not in ("attempted", "recovered", "recovery_requested", "failed"):
             raise gl.vm.UserError("No unconfirmed payout to confirm")
         b.payout_status = "delivered"
         self.bets[bet_id] = b
@@ -447,27 +481,22 @@ class RealityBet(gl.Contract):
         return True
 
     @gl.public.write
-    def retry_refund(self, bet_id: str) -> u256:
-        """Re-emit a voided-market refund whose transfer never landed."""
+    def recover_refund(self, bet_id: str) -> u256:
+        """Re-emit a voided-market refund that the owner verified as failed."""
         b = self._get_bet(bet_id)
         m = self._get_market(b.market_id)
         if not b.bettor == gl.message.sender_address:
             raise gl.vm.UserError("Not your bet")
         if not b.claimed:
-            raise gl.vm.UserError("Nothing to retry - refund first")
+            raise gl.vm.UserError("Nothing to recover - refund first")
         if not m.status == MarketStatus.VOIDED:
             raise gl.vm.UserError("Market not voided")
         payout = b.payout if int(b.payout) > 0 else b.amount
-        if b.payout_status != "failed":
-            raise gl.vm.UserError("Prior delivery not marked failed - no retry allowed")
-        # Same rule as retry_payout: the cap binds the payee, an owner
-        # countersign buys exactly one re-emission past it.
-        if int(b.retry_count) >= MAX_RETRIES and not b.countersigned:
-            raise gl.vm.UserError("Retry limit reached")
+        if b.payout_status != "failed" or not b.authorized:
+            raise gl.vm.UserError("Recovery not authorized by owner")
         gl.get_contract_at(b.bettor).emit_transfer(value=payout)
-        b.retry_count = u256(int(b.retry_count) + 1)
+        b.authorized = False
         b.payout_status = "recovered"
-        b.countersigned = False
         self.bets[bet_id] = b
         return payout
 
@@ -498,33 +527,9 @@ class RealityBet(gl.Contract):
         return f.amount
 
     @gl.public.write
-    def retry_funding_refund(self, funding_id: str) -> u256:
-        """Re-emit a funding refund only after its delivery is marked failed."""
-        if funding_id not in self.fundings:
-            raise gl.vm.UserError("Funding not found")
-        f = self.fundings[funding_id]
-        if not f.funder == gl.message.sender_address:
-            raise gl.vm.UserError("Not your funding")
-        if f.refund_status != "failed":
-            raise gl.vm.UserError("Prior delivery not marked failed - no retry allowed")
-        # The cap binds the funder; an owner countersign unlocks one more try.
-        if int(f.retry_count) >= MAX_RETRIES and not f.countersigned:
-            raise gl.vm.UserError("Retry limit reached")
-        gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
-        f.retry_count = u256(int(f.retry_count) + 1)
-        f.refund_status = "recovered"
-        f.countersigned = False
-        self.fundings[funding_id] = f
-        return f.amount
-
-    @gl.public.write
-    def report_failed_funding_refund(self, funding_id: str) -> bool:
-        """Funder attests non-delivery; past the cap the owner countersigns.
-
-        Same rule as report_failed_payout: the funder's own report is refused
-        at the cap, while an owner countersign records the failure and unlocks
-        exactly one further re-emission.
-        """
+    def request_funding_recovery(self, funding_id: str) -> bool:
+        """Funder reports non-delivery of a refund transfer. Moves no money on
+        its own — re-emission requires the owner's authorization."""
         if funding_id not in self.fundings:
             raise gl.vm.UserError("Funding not found")
         f = self.fundings[funding_id]
@@ -533,13 +538,53 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Not authorized")
         if f.refund_status not in ("attempted", "recovered"):
             raise gl.vm.UserError("No unconfirmed refund to report")
-        if int(f.retry_count) >= MAX_RETRIES:
-            if not sender == self.owner:
-                raise gl.vm.UserError("Retry limit reached - owner countersign required")
-            f.countersigned = True
-        f.refund_status = "failed"
+        f.refund_status = "recovery_requested"
         self.fundings[funding_id] = f
         return True
+
+    @gl.public.write
+    def authorize_funding_recovery(self, funding_id: str, authorized: bool) -> bool:
+        """Owner gate for a funding-refund recovery: the independent proof of
+        non-delivery. Denying returns the refund to attempted so a late
+        delivery can still be confirmed. Each authorization is spent by
+        exactly one recovery emit."""
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        if f.refund_status != "recovery_requested":
+            raise gl.vm.UserError("No recovery requested for this refund")
+        if authorized:
+            f.refund_status = "failed"
+            f.authorized = True
+        else:
+            f.refund_status = "attempted"
+        self.fundings[funding_id] = f
+        return True
+
+    @gl.public.write
+    def recover_funding_refund(self, funding_id: str) -> u256:
+        """Re-emit a funding refund only after the owner verified the failure."""
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        if not f.funder == gl.message.sender_address:
+            raise gl.vm.UserError("Not your funding")
+        if f.refund_status != "failed" or not f.authorized:
+            raise gl.vm.UserError("Recovery not authorized by owner")
+        gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
+        f.authorized = False
+        f.refund_status = "recovered"
+        self.fundings[funding_id] = f
+        return f.amount
+
+    @gl.public.write
+    def report_failed_funding_refund(self, funding_id: str) -> bool:
+        """Funder attests non-delivery. Moves no money on its own — see
+        request_funding_recovery; kept as an alias for the payee-facing flow."""
+        return self.request_funding_recovery(funding_id)
+
 
     @gl.public.write
     def confirm_funding_refund(self, funding_id: str) -> bool:
@@ -548,7 +593,7 @@ class RealityBet(gl.Contract):
         f = self.fundings[funding_id]
         if gl.message.sender_address not in (f.funder, self.owner):
             raise gl.vm.UserError("Not authorized")
-        if f.refund_status not in ("attempted", "recovered"):
+        if f.refund_status not in ("attempted", "recovered", "recovery_requested", "failed"):
             raise gl.vm.UserError("No unconfirmed refund to confirm")
         f.refund_status = "delivered"
         f.refunded = True
@@ -758,8 +803,7 @@ class RealityBet(gl.Contract):
         return {"id": b.id, "market_id": b.market_id, "bettor": format(b.bettor, "x"),
                 "side": b.side, "amount": int(b.amount), "claimed": b.claimed,
                 "placed_at": int(b.placed_at), "payout": int(b.payout),
-                "payout_status": b.payout_status, "retry_count": int(b.retry_count),
-                "countersigned": b.countersigned}
+                "payout_status": b.payout_status, "authorized": b.authorized}
 
     def _seq(self, mid: str) -> int:
         """Sort key for "m<count>-<timestamp>" ids — string order would put m10 before m2."""
@@ -843,8 +887,7 @@ class RealityBet(gl.Contract):
         f = self.fundings[funding_id]
         return {"id": f.id, "market_id": f.market_id, "funder": format(f.funder, "x"),
                 "amount": int(f.amount), "refunded": f.refunded,
-                "refund_status": f.refund_status, "retry_count": int(f.retry_count),
-                "countersigned": f.countersigned}
+                "refund_status": f.refund_status, "authorized": f.authorized}
 
     @gl.public.view
     def get_market_fundings(self, market_id: str) -> typing.Any:

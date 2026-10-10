@@ -244,15 +244,15 @@ React **19** + TypeScript + **Vite** + **Tailwind CSS 4** + **react-router-dom 7
 **Environment** (`frontend/.env.example`):
 
 ```
-VITE_CONTRACT_ADDRESS=0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc
+VITE_CONTRACT_ADDRESS=0xAe0D8d3a9e8E15816571308B65f9Ddd4B925F4b5
 VITE_NETWORK=studionet
 VITE_RPC_URL=            # optional absolute URL or "direct"
 VITE_SEED_MARKETS=       # optional comma-separated market ids
 ```
 
-**Deployed contract:** [`0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc`](https://explorer-studio.genlayer.com/address/0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc) on **GenLayer Studio** (chain id 61999).
+**Deployed contract:** [`0xAe0D8d3a9e8E15816571308B65f9Ddd4B925F4b5`](https://explorer-studio.genlayer.com/address/0xAe0D8d3a9e8E15816571308B65f9Ddd4B925F4b5) on **GenLayer Studio** (chain id 61999).
 
-> Official new deployment — [import into Studio](https://studio.genlayer.com/?import-contract=0x6803eEEa9C7814D7B39783b271009a01E0E2B1Cc). It replaces the earlier `0x33Ed…CBAa4` instance; it starts empty, so markets must be created (or re-seeded) on the new contract.
+> Official StudioNet manual deployment — [import into Studio](https://studio.genlayer.com/?import-contract=0xAe0D8d3a9e8E15816571308B65f9Ddd4B925F4b5). It replaces the earlier `0x6803…B1Cc` / `0x33Ed…CBAa4` instances; it starts empty, so markets must be created (or re-seeded) on the new contract.
 
 ---
 

@@ -34,6 +34,33 @@ def _past_dispute_window(direct_vm):
     direct_vm.warp("2025-01-02T01:00:01Z")
 
 
+# An emitted transfer is async: it either lands on the settlement layer or it
+# fails. The contract records the payee's on-chain balance before every emit
+# and re-reads it at recovery time, so a test must model BOTH outcomes to be
+# meaningful: an un-credited balance (delivery genuinely failed) or a credited
+# one (the transfer landed). "_past_settle_grace" moves past the window in
+# which a fresh emit could still land, making a non-delivery report valid.
+_SETTLE_GRACE = 3600
+
+
+def _past_settle_grace(direct_vm, from_iso):
+    ts = _ts(from_iso) + _SETTLE_GRACE
+    direct_vm.warp(
+        datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+
+
+def _addr_bytes(addr):
+    """Normalise any address form (calldata hex str / Address / bytes) to the
+    raw bytes key the VM balance ledger uses."""
+    if isinstance(addr, (bytes, bytearray)):
+        return bytes(addr)
+    s = str(addr).lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    return bytes.fromhex(s)
+
+
 def _hex(addr):
     """Address fixtures vary by genlayer-test version (bytes, str, Address),
     while the contract's string views expect 0x-hex. Normalise either form."""
@@ -738,13 +765,24 @@ def test_only_one_dispute_can_ever_land_an_outcome(
     assert 9850 + 0 <= 6000 + 4000
 
 
-def _capture_transfers(direct_vm):
-    """Install a gl_call hook that records every PostMessage (value transfer)."""
+def _capture_transfers(direct_vm, deliver=False):
+    """Install a gl_call hook that records every PostMessage (value transfer).
+
+    deliver=True simulates a successful settlement: the recipient's on-chain
+    balance is credited with the transferred value — exactly the evidence the
+    contract's delivery check re-reads at recovery time. deliver=False leaves
+    balances untouched, i.e. a transfer that was emitted but never LANDED,
+    which is the only case recovery exists for.
+    """
     emitted = []
 
     def hook(vm, request):
         if isinstance(request, dict) and "PostMessage" in request:
-            emitted.append(request["PostMessage"])
+            e = request["PostMessage"]
+            emitted.append(e)
+            if deliver:
+                key = _addr_bytes(e["address"])
+                vm._balances[key] = vm._balances.get(key, 0) + int(e["value"])
             return {"ok": None}
         return None
 
@@ -754,6 +792,15 @@ def _capture_transfers(direct_vm):
 
 def _payouts_to(emitted, addr):
     return [e for e in emitted if str(e["address"]).lower() == _hex(addr).lower()]
+
+
+def _emits_of(emitted, addr, value):
+    """Emits to `addr` carrying exactly `value` — used when other emits (e.g.
+    the platform fee) also land on the same address and must not be confused
+    with entitlement transfers."""
+    addr_hex = _hex(addr).lower()
+    return [e for e in emitted
+            if str(e["address"]).lower() == addr_hex and int(e["value"]) == value]
 
 
 def test_fund_market_records_entitlement_and_void_recovers(
@@ -832,30 +879,34 @@ def test_failed_funding_refund_recovery_is_owner_gated(
     direct_vm.sender = direct_owner
     contract.void_market(mid)
 
-    emitted = _capture_transfers(direct_vm)
+    # Genuine failure: the refund is emitted but never lands.
+    emitted = _capture_transfers(direct_vm, deliver=False)
     direct_vm.sender = direct_alice
     assert int(contract.refund_funding(fids[0])) == 600
     assert contract.get_funding(fids[0])["refunded"] is False
     assert contract.get_funding(fids[0])["refund_status"] == "attempted"
     assert len(emitted) == 1 and int(emitted[0]["value"]) == 600
 
-    # A funder's own failure report moves no money: it only requests recovery.
+    # A funder's own failure report moves no money: it only requests recovery,
+    # and only once the transfer has had its settle-grace to land.
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
     assert contract.report_failed_funding_refund(fids[0]) is True
     assert contract.get_funding(fids[0])["refund_status"] == "recovery_requested"
     assert len(emitted) == 1
 
-    # Recovery without the owner's on-chain authorization is rejected —
+    # Recovery without the verifier's on-chain authorization is rejected —
     # self-reported non-delivery can never trigger a re-emission.
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_funding_refund(fids[0])
     assert len(emitted) == 1
 
-    # The owner separately verifies non-delivery (explorer/ledger balance)
-    # and authorizes on-chain; the funder then gets exactly one recovery emit.
+    # The owner separately verifies non-delivery and authorizes on-chain; the
+    # funder then gets exactly one recovery emit.
     direct_vm.sender = direct_owner
-    assert contract.authorize_funding_recovery(fids[0], True) is True
+    assert contract.authorize_funding_recovery(fids[0]) is True
     assert contract.get_funding(fids[0])["refund_status"] == "failed"
     assert contract.get_funding(fids[0])["authorized"] is True
+    assert contract.get_funding(fids[0])["authorized_by"].lower() == _hex(direct_owner).lower()
     direct_vm.sender = direct_alice
     assert int(contract.recover_funding_refund(fids[0])) == 600
     assert contract.get_funding(fids[0])["refund_status"] == "recovered"
@@ -864,7 +915,7 @@ def test_failed_funding_refund_recovery_is_owner_gated(
 
     # The authorization is consumed: a second recovery is impossible even if
     # a "failed" status were left over, and nothing reopens without a fresh
-    # owner gate.
+    # verification gate.
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_funding_refund(fids[0])
     assert len(emitted) == 2
@@ -881,7 +932,7 @@ def test_failed_funding_refund_recovery_is_owner_gated(
 def test_owner_denial_returns_refund_to_attempted(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """The owner's deny is also an independent verification: "the transfer did
+    """The verifier's deny is also an independent verification: "the transfer did
     land" — and it reopens exactly the confirm-late-delivery path, nothing else."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
@@ -895,11 +946,12 @@ def test_owner_denial_returns_refund_to_attempted(
     contract.void_market(mid)
     direct_vm.sender = direct_alice
     contract.refund_funding(fids[0])
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
     contract.report_failed_funding_refund(fids[0])
 
     direct_vm.sender = direct_owner
     # Deny = "I verified the refund DID land" → back to attempted.
-    assert contract.authorize_funding_recovery(fids[0], False) is True
+    assert contract.reject_funding_recovery(fids[0]) is True
     assert contract.get_funding(fids[0])["refund_status"] == "attempted"
     assert contract.get_funding(fids[0])["authorized"] is False
 
@@ -934,12 +986,13 @@ def test_refund_funding_rejects_non_funder(
 def test_failed_payout_recovery_is_owner_gated(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """A self-reported delivery failure can never trigger a second payout.
+    """A self-reported delivery failure can never trigger a second payout —
+    and neither can the owner's signature alone, because the contract's own
+    on-chain delivery evidence is the final gate.
 
-    The bettor's report only *requests* recovery; the recorded entitlement is
-    re-emitted solely after the owner independently verifies non-delivery
-    (explorer/ledger balance) and authorizes it on-chain — and each
-    authorization is spent by exactly one recovery transfer.
+    The hook credits nobody: the payout transfer is emitted but never lands,
+    so the payee's balance is the objective proof of non-delivery that the
+    whole protocol rests on.
     """
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
@@ -955,7 +1008,9 @@ def test_failed_payout_recovery_is_owner_gated(
     contract.request_resolution(mid)
     _past_dispute_window(direct_vm)
 
-    emitted = _capture_transfers(direct_vm)
+    # Genuine failure: the transfer is emitted, but no balance is ever
+    # credited — delivery provably never happened.
+    emitted = _capture_transfers(direct_vm, deliver=False)
     direct_vm.sender = direct_alice
     payout = int(contract.claim_winnings(bid))
     assert payout == 985
@@ -965,28 +1020,36 @@ def test_failed_payout_recovery_is_owner_gated(
     assert len(_payouts_to(emitted, direct_alice)) == 1
     assert int(_payouts_to(emitted, direct_alice)[0]["value"]) == 985
 
+    # A report filed inside the settle grace is not evidence of anything:
+    # the transfer may still be in flight, so it is rejected.
+    with direct_vm.expect_revert("Transfer still settling"):
+        contract.report_failed_payout(bid)
+
     # With no failure reported there is no recovery request: re-emission is
     # rejected, not silently allowed.
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_payout(bid)
 
-    # The bettor attests non-delivery — this moves NO money, it only flags
-    # the entitlement as recovery_requested so the owner can review it.
+    # The transfer has now had its full window to land and did not — the
+    # payee's report is valid evidence of non-delivery. It still moves NO
+    # money; it only flags the entitlement for verification.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
     assert contract.report_failed_payout(bid) is True
     assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
     assert len(_payouts_to(emitted, direct_alice)) == 1  # nothing re-emitted
 
-    # Recovery still rejected without the owner's separate authorization.
+    # Recovery still rejected without the verifier's on-chain authorization.
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_payout(bid)
     assert len(_payouts_to(emitted, direct_alice)) == 1
 
-    # The owner independently verifies non-delivery, then authorizes on-chain.
+    # The owner independently verifies the failure and authorizes on-chain.
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     b = contract.get_bet(bid)
     assert b["payout_status"] == "failed"
     assert b["authorized"] is True
+    assert b["authorized_by"].lower() == _hex(direct_owner).lower()
 
     # Now — and only now — the recorded entitlement is re-emitted exactly once.
     direct_vm.sender = direct_alice
@@ -994,6 +1057,7 @@ def test_failed_payout_recovery_is_owner_gated(
     b = contract.get_bet(bid)
     assert b["payout_status"] == "recovered"
     assert b["authorized"] is False  # authorization consumed by that one emit
+    assert b["authorized_by"] == ""
     assert len(_payouts_to(emitted, direct_alice)) == 2
     assert int(_payouts_to(emitted, direct_alice)[1]["value"]) == 985
 
@@ -1019,7 +1083,8 @@ def test_owner_cannot_authorize_without_a_request(
 ):
     """The authorization gate is never a bypass: it only decides a *pending*
     payee request, so the owner cannot authorize a transfer nobody reported —
-    and cannot unilaterally re-open an attempted transfer either."""
+    and even a valid authorization is overridden by the contract's own
+    on-chain delivery evidence."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
     mid = _setup_open_market(direct_vm, contract)
@@ -1033,19 +1098,36 @@ def test_owner_cannot_authorize_without_a_request(
     _mock_resolution(direct_vm, "yes")
     contract.request_resolution(mid)
     _past_dispute_window(direct_vm)
+    # This transfer LANDS: the hook credits the payee's balance, so the chain
+    # itself shows delivery and no report/authorization combo can undo that.
+    emitted = _capture_transfers(direct_vm, deliver=True)
     direct_vm.sender = direct_alice
-    contract.claim_winnings(bid)  # attempted, no request filed
+    assert int(contract.claim_winnings(bid)) == 887
+    assert len(_payouts_to(emitted, direct_alice)) == 1
 
-    # Owner cannot authorize a recovery that was never requested.
+    # Owner cannot authorize a recovery that was never requested — the
+    # verification gate only decides a *pending* payee report.
     direct_vm.sender = direct_owner
     with direct_vm.expect_revert("No recovery requested for this payout"):
-        contract.authorize_recovery(bid, True)
+        contract.authorize_recovery(bid)
+
+    # Even once requested, authorization cannot override the contract's own
+    # delivery evidence: this transfer landed (the hook credited the payee),
+    # so the re-emission reverts with evidence, not with a permission error.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    direct_vm.sender = direct_alice
+    assert contract.report_failed_payout(bid) is True
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid) is True
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Delivery observed on-chain"):
+        contract.recover_payout(bid)
 
 
 def test_failed_refund_recovery_is_owner_gated(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """Same two-party gate on the voided-market refund path."""
+    """Same evidence-gated protocol on the voided-market refund path."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
     mid = _setup_open_market(direct_vm, contract)
@@ -1056,7 +1138,8 @@ def test_failed_refund_recovery_is_owner_gated(
     direct_vm.sender = direct_owner
     contract.void_market(mid)
 
-    emitted = _capture_transfers(direct_vm)
+    # Undelivered refund: emitted, but the payee's balance never moves.
+    emitted = _capture_transfers(direct_vm, deliver=False)
     direct_vm.sender = direct_alice
     assert contract.refund_void(bid) is True
     assert contract.get_bet(bid)["payout"] == 1200
@@ -1064,18 +1147,19 @@ def test_failed_refund_recovery_is_owner_gated(
     assert len(emitted) == 1 and int(emitted[0]["value"]) == 1200
 
     # The bettor's report only requests recovery — no transfer is re-emitted.
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
     assert contract.report_failed_payout(bid) is True
     assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
     assert len(emitted) == 1
 
-    # Without the owner's authorization there is no recovery emit.
+    # Without the verifier's authorization there is no recovery emit.
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_refund(bid)
     assert len(emitted) == 1
 
     # The owner verifies non-delivery and authorizes; exactly one re-emission.
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_refund(bid)) == 1200
     assert contract.get_bet(bid)["payout_status"] == "recovered"
@@ -1099,12 +1183,12 @@ def test_payee_cannot_self_authorized_recovery_on_any_path(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
     """Fraud matrix: no payee-only action sequence on any of the three transfer
-    paths can produce more than the original single emission. Every re-emission
-    requires an owner authorization that only verifies non-delivery — modeled
-    here as the owner's on-chain decision after the payee request."""
+    paths can produce more than the original single emission. Reporting is the
+    only payee power; verifying is reserved to an independent account, and the
+    contract's own delivery evidence backs both."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
-    emitted = _capture_transfers(direct_vm)
+    emitted = _capture_transfers(direct_vm)  # nothing ever credits: genuine failures
 
     # ── payout path ───────────────────────────────────────────────
     mid = _setup_open_market(direct_vm, contract)
@@ -1124,33 +1208,36 @@ def test_payee_cannot_self_authorized_recovery_on_any_path(
 
     # The entire payee-only toolset can never move a second transfer: a
     # report only flags recovery_requested (repeat reports revert), recovery
-    # without authorization reverts, and the payee cannot self-authorize.
+    # without authorization reverts, and the payee can never verify.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
     assert contract.report_failed_payout(bid) is True
     with direct_vm.expect_revert("No unconfirmed payout to report"):
         contract.report_failed_payout(bid)  # already requested
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_payout(bid)
-    with direct_vm.expect_revert("Only owner"):
-        contract.authorize_recovery(bid, True)  # payee can't self-authorize
+    with direct_vm.expect_revert("Only owner or recovery guardian"):
+        contract.authorize_recovery(bid)  # payee can't verify
     assert len(_payouts_to(emitted, direct_alice)) == 1
     assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
 
     # ...and the owner, exercising independent verification, can unlock the
     # single recovery the report requested. The authorization is then spent.
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_payout(bid)) == 985
     assert len(_payouts_to(emitted, direct_alice)) == 2
     assert contract.get_bet(bid)["authorized"] is False
 
-    # A second cycle needs a NEW report AND a NEW owner verification, one
-    # authorization per re-emitted transfer — never a runaway replay loop.
+    # A second cycle needs a NEW report (after that emit's own settle grace)
+    # AND a NEW owner verification — one authorization per re-emitted
+    # transfer, never a runaway replay loop.
+    _past_settle_grace(direct_vm, "2025-01-02T02:00:01Z")
     assert contract.report_failed_payout(bid) is True
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_payout(bid)
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_payout(bid)) == 985
     assert len(_payouts_to(emitted, direct_alice)) == 3
@@ -1174,14 +1261,17 @@ def test_payee_cannot_self_authorized_recovery_on_any_path(
 
     # Payee-only sequence: report and recover all rejected. (Count includes
     # the refund's original emission, so 4 right now.)
+    _past_settle_grace(direct_vm, "2025-01-03T00:00:00Z")
     assert contract.report_failed_payout(bid2) is True
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_refund(bid2)
+    with direct_vm.expect_revert("Only owner or recovery guardian"):
+        contract.authorize_recovery(bid2)
     assert len(_payouts_to(emitted, direct_alice)) == 4
 
     # The report is honored only after the owner verifies non-delivery.
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid2, True) is True
+    assert contract.authorize_recovery(bid2) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_refund(bid2)) == 800
     assert contract.get_bet(bid2)["authorized"] is False
@@ -1202,11 +1292,14 @@ def test_payee_cannot_self_authorized_recovery_on_any_path(
     contract.void_market(mid3)
     direct_vm.sender = direct_alice
     assert int(contract.refund_funding(fids[0])) == 300
+    _past_settle_grace(direct_vm, "2025-01-05T00:00:00Z")
     assert contract.report_failed_funding_refund(fids[0]) is True
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_funding_refund(fids[0])
+    with direct_vm.expect_revert("Only owner or recovery guardian"):
+        contract.authorize_funding_recovery(fids[0])
     direct_vm.sender = direct_owner
-    assert contract.authorize_funding_recovery(fids[0], True) is True
+    assert contract.authorize_funding_recovery(fids[0]) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_funding_refund(fids[0])) == 300
     assert contract.get_funding(fids[0])["authorized"] is False
@@ -1223,17 +1316,17 @@ def test_payee_cannot_self_authorized_recovery_on_any_path(
 def test_owner_authorization_gates_every_recovery(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """The two-party protocol in full: payee request, owner verification,
-    single re-emission, repeatable only through the same gate.
+    """The evidence-gated protocol in full: payee report, independent
+    verification, single re-emission, repeatable only through the same gate.
 
-    A transfer that fails twice is never stranded: the owner simply authorizes
-    a second cycle after verifying the second failure too. What no payee can
-    ever do is shortcut the gate — which is why no self-reported failure can
-    mint a second payout or refund.
+    A transfer that fails repeatedly is never stranded: the verifier simply
+    authorizes another cycle after confirming each failure against the chain's
+    delivery evidence. What no payee can ever do is shortcut the gate — which
+    is why no self-reported failure can mint a second payout or refund.
     """
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
-    emitted = _capture_transfers(direct_vm)
+    emitted = _capture_transfers(direct_vm)  # every emit genuinely fails
 
     mid = _setup_open_market(direct_vm, contract)
     direct_vm.sender = direct_alice
@@ -1251,20 +1344,22 @@ def test_owner_authorization_gates_every_recovery(
     # authorizes → recovery emits attempt 2, which fails too.
     direct_vm.sender = direct_alice
     assert int(contract.claim_winnings(bid)) == 985
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
     assert contract.report_failed_payout(bid) is True
     assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
     assert len(_payouts_to(emitted, direct_alice)) == 1
 
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_payout(bid)) == 985          # attempt 2
     assert contract.get_bet(bid)["payout_status"] == "recovered"
     assert contract.get_bet(bid)["authorized"] is False      # spent
     assert len(_payouts_to(emitted, direct_alice)) == 2
 
-    # Double-failed: the payee reports again, but the report alone still moves
-    # nothing — recovery stays gated.
+    # Double-failed: the payee reports again (after attempt 2's settle grace),
+    # but the report alone still moves nothing — recovery stays gated.
+    _past_settle_grace(direct_vm, "2025-01-02T02:00:01Z")
     assert contract.report_failed_payout(bid) is True
     assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
     with direct_vm.expect_revert("Recovery not authorized by owner"):
@@ -1273,31 +1368,33 @@ def test_owner_authorization_gates_every_recovery(
 
     # The owner verifies the second failure and authorizes again.
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_payout(bid)) == 985          # attempt 3
     assert contract.get_bet(bid)["payout_status"] == "recovered"
     assert contract.get_bet(bid)["authorized"] is False
     assert len(_payouts_to(emitted, direct_alice)) == 3
 
-    # Each further failure needs a fresh request plus a fresh owner
+    # Each further failure needs a fresh request plus a fresh independent
     # verification — never stuck, never self-serve.
+    _past_settle_grace(direct_vm, "2025-01-02T03:00:01Z")
     assert contract.report_failed_payout(bid) is True
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_payout(bid)) == 985          # attempt 4
     assert len(_payouts_to(emitted, direct_alice)) == 4
 
-    # Confirming delivery still closes the entitlement for good — no owner
+    # Confirming delivery still closes the entitlement for good — no verifier
     # path or payee report can ever re-open a delivered transfer.
     assert contract.confirm_payout(bid) is True
     assert contract.get_bet(bid)["payout_status"] == "delivered"
-    direct_vm.sender = direct_owner
+    direct_vm.sender = direct_alice
     with direct_vm.expect_revert("No unconfirmed payout to report"):
         contract.report_failed_payout(bid)
+    direct_vm.sender = direct_owner
     with direct_vm.expect_revert("No recovery requested for this payout"):
-        contract.authorize_recovery(bid, True)
+        contract.authorize_recovery(bid)
     direct_vm.sender = direct_alice
     with direct_vm.expect_revert("No unconfirmed payout to report"):
         contract.report_failed_payout(bid)
@@ -1308,13 +1405,14 @@ def test_owner_authorization_gates_every_recovery(
 def test_owner_authorization_gates_refunds_too(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
-    """The same two-party protocol on the other two transfer paths: a
+    """The same evidence-gated protocol on the other two transfer paths: a
     voided-market refund and a funding refund that each fail twice are never
-    stranded (the owner re-authorizes after each verified failure), while the
-    payee alone can never move money past the original emit."""
+    stranded (an independent verifier re-authorizes after each verified
+    failure), while the payee alone can never move money past the original
+    emit."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
-    emitted = _capture_transfers(direct_vm)
+    emitted = _capture_transfers(direct_vm)  # every emit genuinely fails
 
     # ── voided-market refund path (recover_refund) ───────────────
     direct_vm.warp("2025-01-01T00:00:00Z")
@@ -1329,18 +1427,20 @@ def test_owner_authorization_gates_refunds_too(
 
     direct_vm.sender = direct_alice
     assert contract.refund_void(bid) is True                  # attempt 1
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
     assert contract.report_failed_payout(bid) is True         # request only
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_refund(bid)) == 800           # attempt 2
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_refund(bid)
 
-    # Second failure: request again, owner verifies and authorizes again.
+    # Second failure: request again, verifier confirms and authorizes again.
+    _past_settle_grace(direct_vm, "2025-01-01T01:00:00Z")
     assert contract.report_failed_payout(bid) is True
     direct_vm.sender = direct_owner
-    assert contract.authorize_recovery(bid, True) is True
+    assert contract.authorize_recovery(bid) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_refund(bid)) == 800           # attempt 3
     assert len(_payouts_to(emitted, direct_alice)) == 3
@@ -1359,27 +1459,250 @@ def test_owner_authorization_gates_refunds_too(
 
     direct_vm.sender = direct_alice
     assert int(contract.refund_funding(fids[0])) == 300       # attempt 1
+    _past_settle_grace(direct_vm, "2025-01-03T00:00:00Z")
     assert contract.report_failed_funding_refund(fids[0]) is True
     direct_vm.sender = direct_owner
-    assert contract.authorize_funding_recovery(fids[0], True) is True
+    assert contract.authorize_funding_recovery(fids[0]) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_funding_refund(fids[0])) == 300  # attempt 2
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_funding_refund(fids[0])
 
-    # Second failure: request again, owner verifies and authorizes again.
+    # Second failure: request again, verifier confirms and authorizes again.
+    _past_settle_grace(direct_vm, "2025-01-03T01:00:00Z")
     assert contract.report_failed_funding_refund(fids[0]) is True
     direct_vm.sender = direct_owner
-    assert contract.authorize_funding_recovery(fids[0], True) is True
+    assert contract.authorize_funding_recovery(fids[0]) is True
     direct_vm.sender = direct_alice
     assert int(contract.recover_funding_refund(fids[0])) == 300  # attempt 3
     assert contract.get_funding(fids[0])["refund_status"] == "recovered"
     assert len(_payouts_to(emitted, direct_alice)) == 6
 
-    # The funder alone still cannot authorize — the gate is owner-only.
+    # The funder alone still cannot verify — the gate is independent-only.
+    _past_settle_grace(direct_vm, "2025-01-03T02:00:00Z")
     assert contract.report_failed_funding_refund(fids[0]) is True
-    with direct_vm.expect_revert("Only owner"):
-        contract.authorize_funding_recovery(fids[0], True)
+    with direct_vm.expect_revert("Only owner or recovery guardian"):
+        contract.authorize_funding_recovery(fids[0])
     with direct_vm.expect_revert("Recovery not authorized by owner"):
         contract.recover_funding_refund(fids[0])
     assert len(_payouts_to(emitted, direct_alice)) == 6
+
+
+def test_recovery_blocked_when_delivery_observed_on_chain(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """The decisive case: the transfer LANDED, and the contract proves it.
+
+    The payout was delivered (the hook credits the payee's balance exactly as
+    the settlement layer would). The payee reports non-delivery anyway and the
+    owner authorizes the recovery — and it STILL cannot re-emit, because the
+    contract re-reads the payee's on-chain balance and sees the delivery. The
+    verdict comes from chain state, not from any caller's word.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
+
+    # This transfer lands: the payee's balance is credited with the 985.
+    emitted = _capture_transfers(direct_vm, deliver=True)
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+    assert int(direct_vm._balances.get(_addr_bytes(direct_alice), 0)) == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Full compliant protocol: settle grace, payee report, owner verification.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    direct_vm.sender = direct_owner
+    assert contract.authorize_recovery(bid) is True
+
+    # ...and the re-emission is STILL rejected — the chain shows delivery.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Delivery observed on-chain"):
+        contract.recover_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # The entitlement remains claimable only through confirmation, not replay.
+    assert contract.confirm_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "delivered"
+
+
+def test_owner_payee_cannot_self_authorize_recovery(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """The owner is also the bettor — the exact self-dealing case.
+
+    The owner may report as the payee, but can NEVER verify their own
+    transfer: self-report + self-authorize is impossible by construction. The
+    only path to the single recovery emit runs through an independent
+    recovery guardian.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_owner
+    direct_vm.value = 1000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    contract.place_bet(mid, "no")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
+
+    # Genuine failure of the owner-bettor's own payout. (The 30 platform fee
+    # also emits to the owner, so count only emits of the entitlement itself.)
+    emitted = _capture_transfers(direct_vm, deliver=False)
+    direct_vm.sender = direct_owner
+    assert int(contract.claim_winnings(bid)) == 1970
+    assert len(_emits_of(emitted, direct_owner, 1970)) == 1
+
+    # The owner may report as the payee...
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "recovery_requested"
+
+    # ...but can never verify it: the same account may not be payee and
+    # verifier. No guardian, no recovery — permanently.
+    with direct_vm.expect_revert("Verifier must differ from the payee"):
+        contract.authorize_recovery(bid)
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    assert len(_emits_of(emitted, direct_owner, 1970)) == 1
+
+    # The guardian appointment is owner-only and must be a different account.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Only owner"):
+        contract.set_recovery_guardian(direct_bob)
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Guardian must differ from owner"):
+        contract.set_recovery_guardian(direct_owner)
+    assert contract.set_recovery_guardian(direct_bob) is True
+    stats = contract.get_platform_stats()
+    assert stats["recovery_guardian"].lower() == _hex(direct_bob).lower()
+
+    # The independent guardian verifies; the owner-bettor collects exactly one
+    # recovery emit — and the authorization is spent.
+    direct_vm.sender = direct_bob
+    assert contract.authorize_recovery(bid) is True
+    b = contract.get_bet(bid)
+    assert b["authorized_by"].lower() == _hex(direct_bob).lower()
+    direct_vm.sender = direct_owner
+    assert int(contract.recover_payout(bid)) == 1970
+    assert len(_emits_of(emitted, direct_owner, 1970)) == 2
+    assert contract.get_bet(bid)["authorized"] is False
+
+    # A second cycle again demands independence: the owner reports, the
+    # guardian verifies — the owner alone never gets a third transfer.
+    _past_settle_grace(direct_vm, "2025-01-02T02:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    with direct_vm.expect_revert("Verifier must differ from the payee"):
+        contract.authorize_recovery(bid)
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    assert len(_emits_of(emitted, direct_owner, 1970)) == 2
+
+
+def test_owner_funder_cannot_self_authorize_funding_recovery(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """Same separation of duties on the funding-refund path: the owner-funder
+    reports, but only an independent guardian may verify."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_owner
+    direct_vm.value = 500
+    contract.fund_market(mid)
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+
+    emitted = _capture_transfers(direct_vm, deliver=False)
+    direct_vm.sender = direct_owner
+    assert int(contract.refund_funding(fids[0])) == 500
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
+    assert contract.request_funding_recovery(fids[0]) is True
+
+    # Owner-funder can report, never verify.
+    with direct_vm.expect_revert("Verifier must differ from the payee"):
+        contract.authorize_funding_recovery(fids[0])
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+    assert len(_payouts_to(emitted, direct_owner)) == 1
+
+    # Independent guardian unlocks exactly one recovery emit.
+    assert contract.set_recovery_guardian(direct_bob) is True
+    direct_vm.sender = direct_bob
+    assert contract.authorize_funding_recovery(fids[0]) is True
+    direct_vm.sender = direct_owner
+    assert int(contract.recover_funding_refund(fids[0])) == 500
+    assert len(_payouts_to(emitted, direct_owner)) == 2
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_funding_refund(fids[0])
+    assert len(_payouts_to(emitted, direct_owner)) == 2
+
+
+def test_owner_cannot_report_for_payee_and_bet_deny_reopens_attempted(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """Reporting is strictly the payee's — even the owner may not file it for
+    them — and a verifier's deny returns the entitlement to attempted, which
+    re-opens only the confirm-late-delivery path."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 1000
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
+
+    emitted = _capture_transfers(direct_vm, deliver=False)
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+
+    # The owner may not report on the payee's behalf.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Only the payee can report non-delivery"):
+        contract.report_failed_payout(bid)
+
+    # Payee reports; the verifier denies ("it did land") → back to attempted.
+    direct_vm.sender = direct_alice
+    assert contract.report_failed_payout(bid) is True
+    direct_vm.sender = direct_owner
+    assert contract.reject_recovery(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "attempted"
+    assert contract.get_bet(bid)["authorized"] is False
+
+    # A denied request authorizes nothing.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Recovery not authorized by owner"):
+        contract.recover_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # ...but a late delivery can still be confirmed, closing the entitlement.
+    assert contract.confirm_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "delivered"

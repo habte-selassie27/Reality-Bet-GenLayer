@@ -11,24 +11,37 @@ import typing
 # outcome that is still appealable.
 DISPUTE_WINDOW = 86400
 
-# Failed-delivery recovery is a two-party protocol. The contract cannot
-# observe the EVM layer where external transfers execute, so no single
-# participant — including the payee — may re-emit a transfer on their own
-# word. A payee can only REQUEST recovery; the owner must then independently
-# verify non-delivery (explorer or ledger balance) and authorize it on-chain.
-# Each authorization is consumed by exactly one recovery transfer, and a
-# confirmed delivery permanently locks the entitlement. The result: a lying
-# payee can never mint themselves a second payout, and a genuinely failed
-# transfer is never stranded as long as the owner acts.
+# An async transfer either lands or fails well within an hour. A non-delivery
+# report filed before the grace elapses is noise, not evidence, so it is
+# rejected — non-delivery is only claimable once delivery provably could
+# have happened.
+RECOVERY_SETTLE_GRACE = 3600
+
+# Failed-delivery recovery is gated by EVIDENCE, not by anyone's say-so.
+# The contract cannot watch the settlement layer, so at every emit it records
+# an objective baseline — the payee's on-chain balance plus the attempt time —
+# and recovery re-checks that baseline itself. Three independent controls
+# must all pass before a second transfer may ever be emitted:
+#
+#   1. REQUEST  — the payee (and only the payee) reports non-delivery, and
+#      only after the transfer has had a full settle-grace to land.
+#   2. VERIFY   — an independent verifier (the owner, or the appointed
+#      recovery_guardian, NEVER the payee) confirms the failure on-chain.
+#   3. EVIDENCE — recover_payout re-reads the payee's balance: if the
+#      transfer already landed, the recovery reverts no matter who
+#      authorized it. Nobody's boolean is "proof" of anything.
 #
 #   attempted ──request_recovery(payee)──► recovery_requested
-#   recovery_requested ──authorize_recovery(owner)──► failed (+authorized)
-#   failed ──recover_payout()──► recovered   (exactly one transfer)
+#   recovery_requested ──authorize_recovery(verifier)──► failed
+#   recovery_requested ──reject_recovery(verifier)──► attempted (delivered late)
+#   failed ──recover_payout(payee)──► recovered   (exactly one transfer)
 #   attempted/recovered/recovery_requested/failed ──confirm_payout()──► delivered
 #
-# A transfer that fails twice simply runs the cycle again; each re-emission
-# still required the owner's fresh authorization, so there is no loop a payee
-# can drive alone — and no retry-count cap is needed to keep the payee honest.
+# Role separation: when the owner is themselves the payee they can report as
+# the payee but can NEVER verify — self-reporting plus self-authorizing is
+# impossible by construction; a recovery_guardian must do the verification.
+# Every authorization is spent by exactly one emit, so a transfer that fails
+# twice just runs the same evidence-gated cycle again.
 
 
 class MarketStatus:
@@ -94,18 +107,27 @@ class Bet:
     # Delivery state machine for the payout transfer:
     #   ""                  -> no payout transfer was ever emitted
     #   "attempted"         -> emitted, delivery not yet confirmed
-    #   "recovery_requested"-> payee reported non-delivery; awaiting owner
-    #   "failed"            -> owner authorized recovery after verifying
-    #                          non-delivery; exactly one recovery allowed
+    #   "recovery_requested"-> payee reported non-delivery; awaiting verification
+    #   "failed"            -> an independent verifier authorized recovery;
+    #                          exactly one recovery emit is unlocked
     #   "recovered"         -> a recovery transfer was emitted, awaiting delivery
     #   "delivered"         -> delivery confirmed; entitlement permanently locked
     payout_status: str
-    # Set only by the owner via authorize_recovery after they have
-    # independently verified that the transfer never landed (explorer/ledger
-    # balance). Consumed — reset to False — by the single recovery emit it
-    # unlocks. No payee action can set it, so no payee can re-emit money on
-    # their own word.
+    # Set only by an independent verifier via authorize_recovery and consumed
+    # — reset to False — by the single recovery emit it unlocks. No payee
+    # action can set it, so no payee can re-emit money on their own word.
     authorized: bool
+    # Delivery evidence recorded at every emit: the payee's on-chain balance
+    # immediately BEFORE the transfer and the attempt time. recover_payout
+    # re-reads the balance against this baseline, so whether the transfer
+    # landed is established by the chain itself — never by a caller-supplied
+    # boolean.
+    balance_base: u256
+    attempted_at: u256
+    # Hex address of the verifier who authorized the recovery, for on-chain
+    # audit. Must differ from the bettor; an owner who is also the payee
+    # cannot appear here (a recovery_guardian does that verification).
+    authorized_by: str
 
 
 @allow_storage
@@ -120,9 +142,14 @@ class Funding:
     # only flips once delivery is confirmed — it is never consumed up-front
     # before the async transfer lands.
     refund_status: str
-    # Same owner authorization as Bet.authorized: owner-only, spent by the
-    # single recovery emit it unlocks.
+    # Same independent-verifier authorization as Bet.authorized: verifier-only,
+    # spent by the single recovery emit it unlocks.
     authorized: bool
+    # Same delivery evidence as Bet: funder balance before the emit + attempt
+    # time, re-checked by recover_funding_refund.
+    balance_base: u256
+    attempted_at: u256
+    authorized_by: str
 
 
 @allow_storage
@@ -143,6 +170,7 @@ class RealityBet(gl.Contract):
     market_bets: TreeMap[str, DynArray[str]]
     bettor_bets: TreeMap[str, DynArray[str]]
     owner: Address
+    recovery_guardian: Address
     platform_fee_bps: u256
     total_volume: u256
     market_count: u256
@@ -154,6 +182,10 @@ class RealityBet(gl.Contract):
 
     def __init__(self):
         self.owner = gl.message.sender_address
+        # Sentinel "unset" state: equal to the owner until a distinct guardian
+        # is appointed. A guardian is required exactly when the owner is also
+        # the payee and would otherwise verify their own transfer.
+        self.recovery_guardian = gl.message.sender_address
         self.platform_fee_bps = u256(150)
         self.total_volume = u256(0)
         self.market_count = u256(0)
@@ -198,6 +230,56 @@ class RealityBet(gl.Contract):
 
     def _addr_key(self, a: Address) -> str:
         return format(a, "x")
+
+    def _as_address(self, a) -> Address:
+        """Coerce any decoded address form (Address, raw bytes, 0x-hex) into an
+        Address so caller-supplied values can land in storage."""
+        if isinstance(a, Address):
+            return a
+        if isinstance(a, (bytes, bytearray)):
+            return Address(bytes(a))
+        s = str(a).lower()
+        if s.startswith("0x"):
+            s = s[2:]
+        return Address(bytes.fromhex(s))
+
+    # ── Delivery evidence helpers ─────────────────────────────
+    #
+    # Non-delivery is established from on-chain state, not from any argument
+    # a caller passes. Every emit records a baseline (payee balance + time);
+    # every recovery re-checks it.
+
+    def _note_bet_attempt(self, b: Bet) -> None:
+        """Record the delivery-evidence baseline for a bet payout transfer."""
+        b.balance_base = gl.get_contract_at(b.bettor).balance
+        b.attempted_at = self._now()
+
+    def _note_funding_attempt(self, f: Funding) -> None:
+        """Record the delivery-evidence baseline for a funding refund transfer."""
+        f.balance_base = gl.get_contract_at(f.funder).balance
+        f.attempted_at = self._now()
+
+    def _delivery_observed(self, payee: Address, base: u256, amount: u256) -> bool:
+        """Objective on-chain evidence that a transfer LANDED: the payee's
+        balance grew by at least the transfer amount since the recorded
+        baseline. Re-checked at recovery time, so it overrides every
+        authorization — a second emission is impossible while the chain still
+        shows the first transfer arriving."""
+        current = int(gl.get_contract_at(payee).balance)
+        return current >= int(base) + int(amount)
+
+    def _authorizer(self, payee: Address) -> None:
+        """Gate for the independent verifier: the owner or the appointed
+        recovery guardian, and never the payee themselves. This is what makes
+        an owner-bettor unable to both report and verify their own failed
+        transfer — the guardian (a different account) must verify."""
+        sender = gl.message.sender_address
+        if not (sender == self.owner or sender == self.recovery_guardian):
+            raise gl.vm.UserError("Only owner or recovery guardian")
+        if sender == payee:
+            raise gl.vm.UserError(
+                "Verifier must differ from the payee - appoint a recovery guardian"
+            )
 
     @gl.public.write
     def create_market(
@@ -292,7 +374,10 @@ class RealityBet(gl.Contract):
         # forever.
         fid = "f" + str(int(self.funding_count)) + "-" + str(int(self._now()))
         self.funding_count = u256(int(self.funding_count) + 1)
-        self.fundings[fid] = Funding(fid, market_id, gl.message.sender_address, v, False, "", False)
+        self.fundings[fid] = Funding(
+            fid, market_id, gl.message.sender_address, v, False, "", False,
+            u256(0), u256(0), "",
+        )
         self.market_fundings.get_or_insert_default(market_id).append(fid)
         return True
 
@@ -313,7 +398,10 @@ class RealityBet(gl.Contract):
         now = self._now()
         bid = "b" + str(int(self.bet_count)) + "-" + str(int(now))
         self.bet_count = u256(int(self.bet_count) + 1)
-        self.bets[bid] = Bet(bid, market_id, bettor, s, amount, False, now, u256(0), "", False)
+        self.bets[bid] = Bet(
+            bid, market_id, bettor, s, amount, False, now, u256(0), "", False,
+            u256(0), u256(0), "",
+        )
         self.market_bets.get_or_insert_default(market_id).append(bid)
         key = self._addr_key(bettor)
         self.bettor_bets.get_or_insert_default(key).append(bid)
@@ -356,66 +444,88 @@ class RealityBet(gl.Contract):
                     gl.get_contract_at(self.owner).emit_transfer(value=fee)
         b.payout = payout
         b.claimed = True
-        b.payout_status = "attempted" if int(payout) > 0 else ""
+        if int(payout) > 0:
+            # Baseline BEFORE the emit: payee balance + attempt time. This is
+            # what later proves whether the transfer landed.
+            self._note_bet_attempt(b)
+            b.payout_status = "attempted"
+        else:
+            b.payout_status = ""
         self.bets[bet_id] = b
         if int(payout) > 0:
             # Transfers are async (PostMessage on 'finalized'): they can fail
             # after the state change commits. The recorded b.payout keeps the
             # entitlement recoverable through request_recovery +
-            # authorize_recovery + recover_payout.
+            # authorize_recovery + recover_payout — each gated by the evidence
+            # recorded above.
             gl.get_contract_at(b.bettor).emit_transfer(value=payout)
         return payout
 
     @gl.public.write
     def request_recovery(self, bet_id: str) -> bool:
-        """Payee reports non-delivery of a payout/refund transfer.
+        """The payee reports non-delivery of a payout/refund transfer.
 
-        A report alone moves no money: it only sets the entitlement to
-        recovery_requested and notifies the owner. Re-emission always
-        requires the owner's separate on-chain authorization, which they
-        give only after independently verifying non-delivery.
+        A report alone moves no money, and it is the PAYEE's report alone:
+        nobody — the owner included — may report on the payee's behalf, which
+        is what removes the self-report half of the self-authorization attack.
+        The report is also only valid once the transfer has had its full
+        settle-grace to land, so it is an evidence-backed claim of failure,
+        not a hunch. It only flags the entitlement recovery_requested for an
+        independent verifier to check.
         """
         b = self._get_bet(bet_id)
-        if gl.message.sender_address not in (b.bettor, self.owner):
-            raise gl.vm.UserError("Not authorized")
+        if not b.bettor == gl.message.sender_address:
+            raise gl.vm.UserError("Only the payee can report non-delivery")
         if b.payout_status not in ("attempted", "recovered"):
             raise gl.vm.UserError("No unconfirmed payout to report")
+        if int(self._now()) < int(b.attempted_at) + RECOVERY_SETTLE_GRACE:
+            raise gl.vm.UserError("Transfer still settling - report after the grace period")
         b.payout_status = "recovery_requested"
         self.bets[bet_id] = b
         return True
 
     @gl.public.write
-    def authorize_recovery(self, bet_id: str, authorized: bool) -> bool:
-        """Owner gate for a recovery: the independent proof of non-delivery.
+    def authorize_recovery(self, bet_id: str) -> bool:
+        """Independent verification of a reported non-delivery.
 
-        Only verified non-delivery may be authorized — denying the request
-        returns the entitlement to attempted so the payee can confirm
-        delivery if the transfer shows up late. Either decision is a fresh
-        owner action; the authorization itself is spent by exactly one
-        recovery emit, so every re-emission is backed by a deliberate,
-        verified owner approval and never by the payee's say-so.
+        No boolean, no proof-by-assertion. The verifier is a dedicated
+        account — the owner, or the appointed recovery_guardian, never the
+        payee — and even their signature is not "proof": recover_payout
+        re-checks the on-chain delivery evidence itself, and reverts if the
+        transfer actually landed. The verification only unlocks exactly ONE
+        recovery emit, which the emit consumes.
         """
-        if not gl.message.sender_address == self.owner:
-            raise gl.vm.UserError("Only owner")
         b = self._get_bet(bet_id)
+        self._authorizer(b.bettor)
         if b.payout_status != "recovery_requested":
             raise gl.vm.UserError("No recovery requested for this payout")
-        if authorized:
-            b.payout_status = "failed"
-            b.authorized = True
-        else:
-            # Refusing keeps the transfer's attempted state — the payee can
-            # still confirm a late delivery, or re-request if it truly failed.
-            b.payout_status = "attempted"
+        b.payout_status = "failed"
+        b.authorized = True
+        b.authorized_by = self._addr_key(gl.message.sender_address)
+        self.bets[bet_id] = b
+        return True
+
+    @gl.public.write
+    def reject_recovery(self, bet_id: str) -> bool:
+        """Independent verification that the transfer DID land: the report is
+        denied and the entitlement returns to attempted, re-opening the
+        confirm-late-delivery path. A denial authorizes nothing."""
+        b = self._get_bet(bet_id)
+        self._authorizer(b.bettor)
+        if b.payout_status != "recovery_requested":
+            raise gl.vm.UserError("No recovery requested for this payout")
+        b.payout_status = "attempted"
         self.bets[bet_id] = b
         return True
 
     @gl.public.write
     def recover_payout(self, bet_id: str) -> u256:
-        """Re-emit a recorded payout/refund that the owner verified as failed.
+        """Re-emit a recorded payout that verifiably never delivered.
 
-        Gated on the owner's authorization — never on a payee's own report —
-        so a self-reported failure can never trigger a second transfer.
+        Three gates must ALL pass, in this order: the recorded entitlement,
+        an independent verifier's authorization, and the contract's own
+        delivery evidence — the payee's balance is re-read and must NOT show
+        the transfer landing. The authorization is spent by this single emit.
         """
         b = self._get_bet(bet_id)
         m = self._get_market(b.market_id)
@@ -432,14 +542,22 @@ class RealityBet(gl.Contract):
                     else MarketStatus.RESOLVED)
         if not m.status == expected:
             raise gl.vm.UserError("Market state does not match recorded payout")
-        # The owner's authorization IS the verified proof of non-delivery.
         if b.payout_status != "failed" or not b.authorized:
             raise gl.vm.UserError("Recovery not authorized by owner")
-        gl.get_contract_at(b.bettor).emit_transfer(value=b.payout)
+        # THE EVIDENCE GATE: the contract re-reads the payee's balance against
+        # the baseline recorded before the emit. If the transfer shows as
+        # landed, no authorization of any kind can produce a second emission.
+        if self._delivery_observed(b.bettor, b.balance_base, b.payout):
+            raise gl.vm.UserError("Delivery observed on-chain - nothing to recover")
+        # New baseline for the re-emitted transfer, so a second failure is
+        # evidenced the same way as the first.
+        self._note_bet_attempt(b)
         # Spent: exactly one recovery transfer per authorization.
         b.authorized = False
+        b.authorized_by = ""
         b.payout_status = "recovered"
         self.bets[bet_id] = b
+        gl.get_contract_at(b.bettor).emit_transfer(value=b.payout)
         return b.payout
 
     @gl.public.write
@@ -475,6 +593,7 @@ class RealityBet(gl.Contract):
         # the refund can never be paid against an outcome that later flips.
         b.payout = b.amount
         b.claimed = True
+        self._note_bet_attempt(b)
         b.payout_status = "attempted"
         self.bets[bet_id] = b
         gl.get_contract_at(b.bettor).emit_transfer(value=b.amount)
@@ -482,7 +601,10 @@ class RealityBet(gl.Contract):
 
     @gl.public.write
     def recover_refund(self, bet_id: str) -> u256:
-        """Re-emit a voided-market refund that the owner verified as failed."""
+        """Re-emit a voided-market refund, gated the same way as recover_payout:
+        independent verifier authorization first, then the contract's own
+        on-chain delivery evidence — a refund that landed is never re-emitted.
+        """
         b = self._get_bet(bet_id)
         m = self._get_market(b.market_id)
         if not b.bettor == gl.message.sender_address:
@@ -494,10 +616,15 @@ class RealityBet(gl.Contract):
         payout = b.payout if int(b.payout) > 0 else b.amount
         if b.payout_status != "failed" or not b.authorized:
             raise gl.vm.UserError("Recovery not authorized by owner")
-        gl.get_contract_at(b.bettor).emit_transfer(value=payout)
+        if self._delivery_observed(b.bettor, b.balance_base, payout):
+            raise gl.vm.UserError("Delivery observed on-chain - nothing to recover")
+        self._note_bet_attempt(b)
+        b.payout = payout
         b.authorized = False
+        b.authorized_by = ""
         b.payout_status = "recovered"
         self.bets[bet_id] = b
+        gl.get_contract_at(b.bettor).emit_transfer(value=payout)
         return payout
 
     @gl.public.write
@@ -521,6 +648,7 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Funding not refundable yet")
         if f.refund_status != "":
             raise gl.vm.UserError("Refund already requested")
+        self._note_funding_attempt(f)
         f.refund_status = "attempted"
         self.fundings[funding_id] = f
         gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
@@ -528,44 +656,62 @@ class RealityBet(gl.Contract):
 
     @gl.public.write
     def request_funding_recovery(self, funding_id: str) -> bool:
-        """Funder reports non-delivery of a refund transfer. Moves no money on
-        its own — re-emission requires the owner's authorization."""
+        """The funder reports non-delivery of a refund transfer. Moves no money
+        on its own — the report is funder-only, settle-grace gated, and only
+        flags the entitlement for an independent verifier."""
         if funding_id not in self.fundings:
             raise gl.vm.UserError("Funding not found")
         f = self.fundings[funding_id]
-        sender = gl.message.sender_address
-        if sender not in (f.funder, self.owner):
-            raise gl.vm.UserError("Not authorized")
+        if not f.funder == gl.message.sender_address:
+            raise gl.vm.UserError("Only the funder can report non-delivery")
         if f.refund_status not in ("attempted", "recovered"):
             raise gl.vm.UserError("No unconfirmed refund to report")
+        if int(self._now()) < int(f.attempted_at) + RECOVERY_SETTLE_GRACE:
+            raise gl.vm.UserError("Transfer still settling - report after the grace period")
         f.refund_status = "recovery_requested"
         self.fundings[funding_id] = f
         return True
 
     @gl.public.write
-    def authorize_funding_recovery(self, funding_id: str, authorized: bool) -> bool:
-        """Owner gate for a funding-refund recovery: the independent proof of
-        non-delivery. Denying returns the refund to attempted so a late
-        delivery can still be confirmed. Each authorization is spent by
-        exactly one recovery emit."""
-        if not gl.message.sender_address == self.owner:
-            raise gl.vm.UserError("Only owner")
+    def authorize_funding_recovery(self, funding_id: str) -> bool:
+        """Independent verification of a reported refund non-delivery.
+
+        Same evidence-gated protocol as authorize_recovery, no boolean: the
+        verifier is the owner or recovery_guardian, never the funder, and the
+        on-chain delivery evidence still overrides the authorization.
+        """
         if funding_id not in self.fundings:
             raise gl.vm.UserError("Funding not found")
         f = self.fundings[funding_id]
+        self._authorizer(f.funder)
         if f.refund_status != "recovery_requested":
             raise gl.vm.UserError("No recovery requested for this refund")
-        if authorized:
-            f.refund_status = "failed"
-            f.authorized = True
-        else:
-            f.refund_status = "attempted"
+        f.refund_status = "failed"
+        f.authorized = True
+        f.authorized_by = self._addr_key(gl.message.sender_address)
+        self.fundings[funding_id] = f
+        return True
+
+    @gl.public.write
+    def reject_funding_recovery(self, funding_id: str) -> bool:
+        """Independent verification that the refund DID land: the report is
+        denied and the entitlement returns to attempted so a late delivery can
+        still be confirmed. A denial authorizes nothing."""
+        if funding_id not in self.fundings:
+            raise gl.vm.UserError("Funding not found")
+        f = self.fundings[funding_id]
+        self._authorizer(f.funder)
+        if f.refund_status != "recovery_requested":
+            raise gl.vm.UserError("No recovery requested for this refund")
+        f.refund_status = "attempted"
         self.fundings[funding_id] = f
         return True
 
     @gl.public.write
     def recover_funding_refund(self, funding_id: str) -> u256:
-        """Re-emit a funding refund only after the owner verified the failure."""
+        """Re-emit a funding refund only after an independent verifier has
+        authorized it AND the contract's own evidence shows the first refund
+        never landed. The authorization is spent by this single emit."""
         if funding_id not in self.fundings:
             raise gl.vm.UserError("Funding not found")
         f = self.fundings[funding_id]
@@ -573,10 +719,14 @@ class RealityBet(gl.Contract):
             raise gl.vm.UserError("Not your funding")
         if f.refund_status != "failed" or not f.authorized:
             raise gl.vm.UserError("Recovery not authorized by owner")
-        gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
+        if self._delivery_observed(f.funder, f.balance_base, f.amount):
+            raise gl.vm.UserError("Delivery observed on-chain - nothing to recover")
+        self._note_funding_attempt(f)
         f.authorized = False
+        f.authorized_by = ""
         f.refund_status = "recovered"
         self.fundings[funding_id] = f
+        gl.get_contract_at(f.funder).emit_transfer(value=f.amount)
         return f.amount
 
     @gl.public.write
@@ -803,7 +953,9 @@ class RealityBet(gl.Contract):
         return {"id": b.id, "market_id": b.market_id, "bettor": format(b.bettor, "x"),
                 "side": b.side, "amount": int(b.amount), "claimed": b.claimed,
                 "placed_at": int(b.placed_at), "payout": int(b.payout),
-                "payout_status": b.payout_status, "authorized": b.authorized}
+                "payout_status": b.payout_status, "authorized": b.authorized,
+                "attempted_at": int(b.attempted_at),
+                "authorized_by": b.authorized_by}
 
     def _seq(self, mid: str) -> int:
         """Sort key for "m<count>-<timestamp>" ids — string order would put m10 before m2."""
@@ -887,7 +1039,9 @@ class RealityBet(gl.Contract):
         f = self.fundings[funding_id]
         return {"id": f.id, "market_id": f.market_id, "funder": format(f.funder, "x"),
                 "amount": int(f.amount), "refunded": f.refunded,
-                "refund_status": f.refund_status, "authorized": f.authorized}
+                "refund_status": f.refund_status, "authorized": f.authorized,
+                "attempted_at": int(f.attempted_at),
+                "authorized_by": f.authorized_by}
 
     @gl.public.view
     def get_market_fundings(self, market_id: str) -> typing.Any:
@@ -945,7 +1099,8 @@ class RealityBet(gl.Contract):
     @gl.public.view
     def get_platform_stats(self) -> dict:
         return {"total_markets": int(self.market_count), "total_volume": int(self.total_volume),
-                "fee_bps": int(self.platform_fee_bps), "owner": format(self.owner, "x")}
+                "fee_bps": int(self.platform_fee_bps), "owner": format(self.owner, "x"),
+                "recovery_guardian": format(self.recovery_guardian, "x")}
 
     @gl.public.write
     def set_fee(self, bps: u256) -> bool:
@@ -957,8 +1112,26 @@ class RealityBet(gl.Contract):
         return True
 
     @gl.public.write
+    def set_recovery_guardian(self, guardian: Address) -> bool:
+        """Appoint the independent verifier for failed-transfer recoveries.
+
+        Required whenever the owner is themselves a payee: the owner may
+        report as the payee but may never verify their own transfer, so a
+        different account must hold verification duty. The guardian can only
+        verify — it cannot move funds, change outcomes, or administer anything
+        else, so appointing one grants no other power.
+        """
+        if not gl.message.sender_address == self.owner:
+            raise gl.vm.UserError("Only owner")
+        g = self._as_address(guardian)
+        if g == self.owner:
+            raise gl.vm.UserError("Guardian must differ from owner")
+        self.recovery_guardian = g
+        return True
+
+    @gl.public.write
     def transfer_ownership(self, new_owner: Address) -> bool:
         if not gl.message.sender_address == self.owner:
             raise gl.vm.UserError("Only owner")
-        self.owner = new_owner
+        self.owner = self._as_address(new_owner)
         return True

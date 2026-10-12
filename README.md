@@ -1,6 +1,6 @@
 # RealityBet — AI-Resolved Prediction Market on GenLayer
 
-**Live demo:** [https://reality-bet.vercel.app](https://reality-bet.vercel.app)
+**Live demo:** [https://reality-bet-gen-layer.vercel.app](https://reality-bet-gen-layer.vercel.app)
 
 ![RealityBet hero](docs/images/hero-logo.jpeg)
 
@@ -374,7 +374,7 @@ After deploy, update `frontend/.env` (`VITE_CONTRACT_ADDRESS`) and redeploy the 
 
 Build command: `npm run build` · Output: `dist/` · Framework: Vite.
 
-Current production: **https://reality-bet.vercel.app**
+Current production: **https://reality-bet-gen-layer.vercel.app**
 
 ---
 

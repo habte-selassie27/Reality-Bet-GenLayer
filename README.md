@@ -146,47 +146,41 @@ Single contract: [`contracts/RealityBet.py`](contracts/RealityBet.py) — class 
 | `place_bet(market_id, side)` *(payable)* | anyone before close | Stake GEN on `yes` or `no`; updates pools + `total_volume` |
 | `claim_winnings(bet_id)` | bettor | Payout once the outcome is **finalized** (win / void refund / 0) |
 | `refund_void(bet_id)` | bettor | Full refund on a `VOIDED` market |
-| `report_failed_payout(bet_id)` (= `request_recovery`) | **payee only**, after the 1h settle grace | Report non-delivery of a payout/refund transfer — **moves no money**, only flags the entitlement for independent verification |
-| `authorize_recovery(bet_id)` | owner **or** `recovery_guardian`, **never the payee** | Independent verification of the report: marks `failed` + `authorized`, unlocking exactly one recovery emit. The contract still re-checks the delivery evidence before any re-emission |
-| `reject_recovery(bet_id)` | owner **or** guardian, never the payee | Deny the report ("the transfer did land") — returns the entitlement to `attempted`, re-opening only the confirm-late-delivery path |
-| `recover_payout(bet_id)` | bettor | Re-emit the recorded payout — only while `authorized` is set **and** the on-chain balance evidence shows the transfer never landed; the authorization is consumed by that single emit |
-| `recover_refund(bet_id)` | bettor | Re-emit a voided-market refund — same evidence-gated protocol |
+| `report_failed_payout(bet_id)` (= `request_recovery`) | **payee only**, after the 1h settle grace | Report non-delivery of a payout/refund transfer — **moves no money**, records the flag for off-chain reconciliation |
 | `confirm_payout(bet_id)` | bettor / owner | Confirm delivery and permanently lock the entitlement |
+| `write_off_payout(bet_id)` | owner | Close an undelivered entitlement **without paying it** — accounting only, terminal |
 | `refund_funding(funding_id)` | funder | Full refund of a `fund_market` deposit when the market is `VOIDED` or resolves `VOID`; entitlement stays unconsumed until delivery is confirmed |
 | `report_failed_funding_refund(funding_id)` (= `request_funding_recovery`) | **funder only**, after the settle grace | Report non-delivery of the funding refund — moves no money |
-| `authorize_funding_recovery(funding_id)` / `reject_funding_recovery(funding_id)` | owner **or** guardian, never the funder | Independent verification gate for the funding-refund recovery |
-| `recover_funding_refund(funding_id)` | funder | Re-emit the funding refund — only while `authorized` is set and delivery evidence contradicts the report |
 | `confirm_funding_refund(funding_id)` | funder / owner | Confirm delivery and lock the refund |
+| `write_off_funding_refund(funding_id)` | owner | Close an undelivered funding refund without paying it |
 | `request_resolution(market_id)` | anyone after `resolve_time` | Runs AI `_resolve` on a `LOCKED` market |
 | `force_resolve(market_id, outcome, note)` | owner | Emergency override (`LOCKED/DISPUTED`) |
 | `raise_dispute(market_id, reason)` | bettor ≤24h post-resolution | `RESOLVED → DISPUTED` |
 | `resolve_dispute(dispute_id, upheld, new_outcome, note)` | owner | Uphold (may flip outcome) or reject |
 | `re_resolve(market_id)` | owner | Re-run AI resolution on a disputed market |
 | `set_fee(bps)` | owner | Max 500 (5%) |
-| `set_recovery_guardian(guardian)` | owner | Appoint the independent verifier for recoveries — required whenever the owner is themselves a payee |
 | `transfer_ownership(new_owner)` | owner | Transfer admin |
 
-### Entitlement / recovery records
+### Entitlement records & payout safety
 
-`fund_market` records a `Funding` (id, market, funder, amount, refunded) per deposit and joins the amount to the pools, so liquidity is never an anonymous, unrecoverable transfer. `Bet.payout` stores the exact amount emitted at claim/refund time, so a transfer that never landed is recoverable instead of lost.
+`fund_market` records a `Funding` (id, market, funder, amount, refunded) per deposit and joins the amount to the pools, so liquidity is never an anonymous, unrecoverable transfer. `Bet.payout` stores the exact amount emitted at claim/refund time, so every transfer attempt is auditable after the fact.
 
-**Recovery is gated by EVIDENCE, not by anyone's say-so.** The contract cannot watch the settlement layer, so at every emit it records the payee's on-chain balance and the attempt time, and recovery re-checks that baseline itself. Three independent controls must all pass before a second transfer may ever be emitted:
+**Payouts are emitted at most once, structurally.** Every payout leaves via `emit_transfer(on='finalized')`, whose child transaction runs *after* the state change commits — and GenLayer exposes **no delivery-status API** for an emitted transfer. The contract-callable surface is `emit_transfer`, `emit`, `view` and `balance`: there is no receipt, no message status, no per-attempt outcome to query. The contract therefore cannot learn whether a past emit landed.
+
+That makes the recipient's balance useless as proof — not merely weak. A payout that **arrived and was then spent** leaves a balance *below* the amount received, which is indistinguishable from a payout that **never arrived**. Any retry gated on "the balance did not grow" re-pays a payee who was already paid, regardless of who authorized it or how many independent checks are stacked on top. (This was the previous design; it was removed.)
+
+Since only one property can be guaranteed, the contract guarantees that one:
 
 ```
-attempted ──report_failed_payout (payee, after settle grace, moves no money)──► recovery_requested
-recovery_requested ──authorize_recovery (owner/guardian, ≠ payee)──► failed + authorized
-recovery_requested ──reject_recovery (owner/guardian, ≠ payee)──► attempted (delivered late)
-failed ──recover_payout──► recovered   [one emit; balance re-checked first]
-any non-delivered state ──confirm_payout──► delivered         [permanently locked]
+claimed ──claim_winnings / refund_void / refund_funding──► attempted   [the one emit]
+attempted ──confirm_payout(payee/owner)─────────────────► delivered    [terminal]
+attempted ──write_off_payout(owner)──────────────────────► written_off [terminal, pays nothing]
+attempted ──report_failed_payout(payee, after 1h grace)─► attempted + non_delivery_reported
 ```
 
-**1 — Report is the payee's alone.** Nobody, the owner included, may file the non-delivery report for a payee, and it is only valid after the transfer's 1h settle grace — so it is an evidence-backed claim, not a hunch.
+**There is no `recover_*` or `authorize_*` method**, because every one of them would need delivery evidence the platform cannot supply. The guarantee is the absence of a re-emit path, not a check that could be weakened: reintroducing a duplicate payment would require adding a method back, not lowering a threshold.
 
-**2 — Verification is independent.** The verifier is the owner or the appointed `recovery_guardian` — and *never* the payee. An owner who is also the bettor/funder can report, but cannot verify: self-report + self-authorize is impossible by construction, and the only route to the recovery emit runs through a different account.
-
-**3 — Chain evidence decides.** No boolean is ever treated as proof. `recover_payout` re-reads the payee's balance against the baseline recorded before the emit: if the transfer shows as landed, the re-emission reverts with `Delivery observed on-chain` no matter who authorized it. A payee's report can never mint a second payout, and neither can an owner's signature.
-
-Every authorization is consumed by exactly one emit, so a transfer that fails repeatedly just runs the same cycle again — never stranded, never self-serve. `refund_funding` leaves `refunded` false until `confirm_funding_refund` attests delivery; the same evidence-gated protocol covers `recover_funding_refund`.
+**What this costs, stated plainly.** A transfer that genuinely fails is *stranded*, not double-paid — the payee's non-delivery report is recorded so an operator can reconcile that specific attempt against the settlement layer **off-chain**, and the entitlement can then be written off or confirmed. That is the correct side to err on, but it is a real limitation, not a solved problem: if GenLayer later exposes an authoritative per-attempt receipt, recovery can be rebuilt on top of it. What must not come back is a balance heuristic.
 
 ### View methods
 
@@ -338,7 +332,7 @@ Requires an environment where the `genlayer-test` pytest plugin is active (e.g. 
 - `get_market_bets_detailed` ordering
 - `get_bettor_bets` 0x / bare-hex address regression
 - Liquidity entitlements: `fund_market` records a `Funding`, rejected pre-void, full refund on `VOIDED` and on VOID-outcome resolution, non-funder revert
-- Failed async payouts: recorded `Bet.payout` survives a lost transfer; recovery is evidence-gated — the payee's `report_failed_payout` only requests (payee-only, after a settle grace), an independent verifier (owner or `recovery_guardian`, never the payee) authorizes, and `recover_payout` / `recover_refund` / `recover_funding_refund` re-emit only after the contract's own balance check proves the transfer never landed; each authorization is spent by exactly one emit and `confirm_payout` permanently locks delivered transfers
+- Payout safety (at most once): all three cases are covered — transfer lands and funds are **kept**, transfer lands and funds are **spent** (the decisive one), and the transfer **genuinely fails**. A balance sweep walks a delivered payout through eight balance shapes (spent to zero, partly spent, replenished above the amount received, dust, enormous) and the emit count never leaves 1. Plus: no `recover_*` / `authorize_*` method exists on the contract, the non-delivery report is payee-only and settle-grace gated, the write-off is owner-only and pays nothing, and the same holds on the void-refund and funding-refund paths
 
 > Note: direct mode runs the **leader only**; full validator consensus runs on-chain.
 

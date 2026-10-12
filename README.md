@@ -247,15 +247,15 @@ React **19** + TypeScript + **Vite** + **Tailwind CSS 4** + **react-router-dom 7
 **Environment** (`frontend/.env.example`):
 
 ```
-VITE_CONTRACT_ADDRESS=0x91D29b9C39d46f32C3E1829e1481bC8b39B3319B
+VITE_CONTRACT_ADDRESS=0x25baAbdf6714f00e6E5b38d12f984231A5Cc5E5A
 VITE_NETWORK=studionet
 VITE_RPC_URL=            # optional absolute URL or "direct"
 VITE_SEED_MARKETS=       # optional comma-separated market ids
 ```
 
-**Deployed contract:** [`0x91D29b9C39d46f32C3E1829e1481bC8b39B3319B`](https://explorer-studio.genlayer.com/address/0x91D29b9C39d46f32C3E1829e1481bC8b39B3319B) on **GenLayer Studio** (chain id 61999).
+**Deployed contract:** [`0x25baAbdf6714f00e6E5b38d12f984231A5Cc5E5A`](https://explorer-studio.genlayer.com/address/0x25baAbdf6714f00e6E5b38d12f984231A5Cc5E5A) on **GenLayer Studio** (chain id 61999).
 
-> Official StudioNet manual deployment — [import into Studio](https://studio.genlayer.com/?import-contract=0x91D29b9C39d46f32C3E1829e1481bC8b39B3319B). It replaces the earlier `0x6803…B1Cc`, `0x33Ed…CBAa4` and `0xAe0D…F4b5` instances; it starts empty, so markets must be created (or re-seeded) on the new contract.
+> Official StudioNet manual deployment — [import into Studio](https://studio.genlayer.com/?import-contract=0x25baAbdf6714f00e6E5b38d12f984231A5Cc5E5A). This is the at-most-once payout build: it has no `recover_*` or `authorize_*` method and exposes `write_off_payout` / `write_off_funding_refund`. It replaces `0x91D2…119B`, which carried the balance-based recovery gate, and the earlier `0x6803…B1Cc`, `0x33Ed…CBAa4` and `0xAe0D…F4b5` instances. It starts empty, so markets must be created (or re-seeded) on the new contract.
 
 ---
 

@@ -764,15 +764,31 @@ def test_only_one_dispute_can_ever_land_an_outcome(
     assert int(contract.claim_winnings(bid_no)) == 0
     assert 9850 + 0 <= 6000 + 4000
 
+# ── Payout safety: at most once ───────────────────────────────────
+#
+# Every payout leaves via emit_transfer(on='finalized'), whose child
+# transaction runs after the state change commits. GenLayer exposes no
+# delivery-status API for an emitted transfer, so the contract cannot learn
+# whether a past emit landed — and the recipient's balance is not a
+# substitute, because funds that arrive and are then spent are
+# indistinguishable from funds that never arrived.
+#
+# So these tests never try to "prove" non-delivery. They prove the stronger
+# structural property that makes proving it unnecessary: an entitlement is
+# emitted exactly once, whatever the balance does afterwards. The decisive
+# case is DELIVERED-THEN-SPENT, where the payee's balance ends up BELOW the
+# amount received — precisely what a balance-delta check reads as "never
+# delivered", and precisely how a duplicate payment used to happen.
+
 
 def _capture_transfers(direct_vm, deliver=False):
     """Install a gl_call hook that records every PostMessage (value transfer).
 
     deliver=True simulates a successful settlement: the recipient's on-chain
-    balance is credited with the transferred value — exactly the evidence the
-    contract's delivery check re-reads at recovery time. deliver=False leaves
-    balances untouched, i.e. a transfer that was emitted but never LANDED,
-    which is the only case recovery exists for.
+    balance is credited with the transferred value. deliver=False leaves
+    balances untouched, i.e. a transfer that was emitted but never landed.
+    Either way the hook swallows the emit, so a test can then move balances
+    around freely to model a payee who spends what they received.
     """
     emitted = []
 
@@ -803,27 +819,549 @@ def _emits_of(emitted, addr, value):
             if str(e["address"]).lower() == addr_hex and int(e["value"]) == value]
 
 
-def test_fund_market_void_outcome_resolution_recovers(
+def _balance(direct_vm, addr):
+    return int(direct_vm._balances.get(_addr_bytes(addr), 0))
+
+
+def _set_balance(direct_vm, addr, value):
+    """Drive the payee's balance to exactly `value`.
+
+    This is how a real recipient's balance stops reflecting a payout they
+    already received: they spend it, or unrelated value moves through the
+    account in either direction.
+    """
+    direct_vm._balances[_addr_bytes(addr)] = int(value)
+
+
+def _resolved_yes_market(direct_vm, contract, stake=1000, bettor=None, counter=None):
+    """One YES bettor, market resolved YES, payouts unlocked. Yields (mid, bet_id).
+
+    `counter` is an optional (address, amount, side) placed before the market
+    locks, for cases that need a second pool participant.
+    """
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = bettor
+    direct_vm.value = stake
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    if counter is not None:
+        who, amount, side = counter
+        direct_vm.sender = who
+        direct_vm.value = amount
+        contract.place_bet(mid, side)
+        direct_vm.value = 0
+    direct_vm.warp("2025-01-01T00:20:00Z")
+    contract.lock_market(mid)
+    direct_vm.warp(_RESOLVED_AT)
+    _mock_resolution(direct_vm, "yes")
+    contract.request_resolution(mid)
+    _past_dispute_window(direct_vm)
+    return mid, bid
+
+
+def test_delivered_payout_is_emitted_once_and_kept_that_way(
     direct_vm, direct_deploy, direct_owner, direct_alice
 ):
+    """Case 1 of 3 — the transfer lands and the payee keeps the funds.
+
+    This is the only shape a balance check could ever read correctly, and it
+    must not be what makes the payout safe. Exactly one emit is ever possible,
+    whether or not anyone reports anything.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    emitted = _capture_transfers(direct_vm, deliver=True)
+    _mid, bid = _resolved_yes_market(direct_vm, contract, bettor=direct_alice)
+
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+    assert _balance(direct_vm, direct_alice) == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # A non-delivery report is still accepted as a claim — it moves no money.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    b = contract.get_bet(bid)
+    assert b["non_delivery_reported"] is True
+    assert b["payout_status"] == "attempted"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Confirmation closes it and clears the report.
+    assert contract.confirm_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "delivered"
+    assert contract.get_bet(bid)["non_delivery_reported"] is False
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Terminal: nothing re-opens a delivered entitlement.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("No unconfirmed payout to report"):
+        contract.report_failed_payout(bid)
+    with direct_vm.expect_revert("No unconfirmed payout to confirm"):
+        contract.confirm_payout(bid)
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("No open payout to write off"):
+        contract.write_off_payout(bid)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Already claimed"):
+        contract.claim_winnings(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+
+def test_delivered_payout_then_spent_is_never_emitted_again(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """Case 2 of 3 — THE decisive case: the transfer lands, then the payee
+    spends it.
+
+    The balance now sits BELOW the amount received, which is exactly what a
+    balance-delta check cannot tell apart from "the transfer never arrived".
+    A retry gated on that reading pays a second time to a payee who was
+    already paid. Here the payout is emitted once and stays that way: through
+    the report, through the write-off that pays nothing, and through a later
+    balance that climbs to an enormous figure.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    emitted = _capture_transfers(direct_vm, deliver=True)
+    _mid, bid = _resolved_yes_market(direct_vm, contract, bettor=direct_alice)
+
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+    assert _balance(direct_vm, direct_alice) == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # The payee moves the money on. Their balance is now BELOW the amount
+    # received — the precise shape a "balance did not grow" rule misreads as a
+    # failed transfer.
+    _set_balance(direct_vm, direct_alice, 0)
+    assert _balance(direct_vm, direct_alice) < 985
+
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    assert contract.get_bet(bid)["non_delivery_reported"] is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Neither closing route may mint a second payment.
+    direct_vm.sender = direct_owner
+    assert contract.write_off_payout(bid) is True      # accounting only
+    assert contract.get_bet(bid)["payout_status"] == "written_off"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    assert _balance(direct_vm, direct_alice) == 0
+
+    # ...and no later balance movement can re-open it either.
+    _past_settle_grace(direct_vm, "2025-01-03T01:00:01Z")
+    _set_balance(direct_vm, direct_alice, 10 ** 30)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("No unconfirmed payout to report"):
+        contract.report_failed_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    assert _balance(direct_vm, direct_alice) == 10 ** 30
+
+
+def test_no_payee_balance_shape_can_unlock_a_second_payout(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """Balance sweep: whatever the payee's balance reads, one emit.
+
+    A delivered payout is walked through every shape a payee can leave an
+    account in — fully spent, partly spent, replenished above the amount
+    received, dust, enormous. Some of those shapes a balance-delta check would
+    have called "not delivered" and paid again; others it would have called
+    "delivered" and blocked. The emit count never leaves 1 either way, and the
+    entitlement survives every one of these shapes still open.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    emitted = _capture_transfers(direct_vm, deliver=True)
+    _mid, bid = _resolved_yes_market(direct_vm, contract, bettor=direct_alice)
+
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    shapes = [0, 1, 500, 984, 985, 1970, 10 ** 6, 10 ** 30]
+    for i, shape in enumerate(shapes):
+        # The balance is driven to `shape` after the payout landed.
+        _set_balance(direct_vm, direct_alice, shape)
+        assert _balance(direct_vm, direct_alice) == shape
+
+        # Each pass re-files the report, so every shape is tested against the
+        # full report path rather than a single observation.
+        _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+        direct_vm.sender = direct_alice
+        assert contract.report_failed_payout(bid) is True
+        assert contract.get_bet(bid)["non_delivery_reported"] is True
+        assert len(_payouts_to(emitted, direct_alice)) == 1
+
+        direct_vm.sender = direct_owner
+        # The owner could close the books at any point in the sweep and still
+        # never pay — which is exactly why the emit count is 1 throughout.
+        assert contract.get_bet(bid)["payout_status"] == "attempted"
+        assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # The entitlement was never closed out by any of it, and closing it now
+    # still moves no money.
+    direct_vm.sender = direct_owner
+    assert contract.write_off_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "written_off"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+
+def test_failed_payout_is_never_re_emitted_and_can_be_closed(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """Case 3 of 3 — the transfer genuinely fails.
+
+    With no delivery-status API and no trustworthy balance signal, the
+    contract cannot tell this apart from a transfer the payee went on to
+    spend. So it must not guess, and must not pay twice. The failed attempt
+    stays visible and closable, and the entitlement is emitted exactly once.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    emitted = _capture_transfers(direct_vm, deliver=False)   # never lands
+    _mid, bid = _resolved_yes_market(direct_vm, contract, bettor=direct_alice)
+
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+    b = contract.get_bet(bid)
+    assert b["payout_status"] == "attempted" and b["payout"] == 985
+    assert _balance(direct_vm, direct_alice) == 0
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # The payee's report is recorded, and moves no money.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    assert contract.get_bet(bid)["non_delivery_reported"] is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # The owner closes the books without paying — the write-off is the honest
+    # outcome for an attempt that provably never landed, and it issues no
+    # replacement transfer.
+    direct_vm.sender = direct_owner
+    assert contract.write_off_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "written_off"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    assert _balance(direct_vm, direct_alice) == 0
+
+    # Written off is terminal, and no amount of balance movement revives it.
+    _past_settle_grace(direct_vm, "2025-01-03T01:00:01Z")
+    _set_balance(direct_vm, direct_alice, 10 ** 30)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("No unconfirmed payout to report"):
+        contract.report_failed_payout(bid)
+    with direct_vm.expect_revert("No unconfirmed payout to confirm"):
+        contract.confirm_payout(bid)
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("No open payout to write off"):
+        contract.write_off_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+
+def test_contract_exposes_no_method_that_can_re_emit(
+    direct_vm, direct_deploy, direct_owner
+):
+    """The at-most-once guarantee is structural, not conditional.
+
+    There is no re-emit entry point to gate in the first place: the
+    balance-delta evidence, its verifier/guardian machinery, and every
+    recovery method built on them are gone. Reintroducing a duplicate payment
+    would require adding a method back, not weakening a check — so there is no
+    threshold a future edit can quietly lower.
+    """
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    for name in (
+        "recover_payout", "recover_refund", "recover_funding_refund",
+        "authorize_recovery", "reject_recovery",
+        "authorize_funding_recovery", "reject_funding_recovery",
+        "set_recovery_guardian",
+    ):
+        assert not hasattr(contract, name), name
+
+
+def test_non_delivery_report_is_payee_only_and_grace_gated(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """Reporting stays the payee's alone, and inside the settle grace it is
+    noise rather than evidence — a fresh emit could still land, so the report
+    waits instead of flagging a race."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    emitted = _capture_transfers(direct_vm, deliver=False)
+    _mid, bid = _resolved_yes_market(direct_vm, contract, bettor=direct_alice)
+
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+
+    # Inside the grace the transfer may still be in flight.
+    with direct_vm.expect_revert("Transfer still settling"):
+        contract.report_failed_payout(bid)
+
+    # Nobody may file it for the payee — the owner included.
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Only the payee can report non-delivery"):
+        contract.report_failed_payout(bid)
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Only the payee can report non-delivery"):
+        contract.report_failed_payout(bid)
+
+    # Past the grace the payee's own report is accepted — and still pays
+    # nothing.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    direct_vm.sender = direct_alice
+    assert contract.report_failed_payout(bid) is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Repeating it is harmless: the flag is already set and no money moves.
+    _past_settle_grace(direct_vm, "2025-01-03T01:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+
+def test_write_off_is_owner_only_and_never_pays(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """The write-off is accounting, so it is owner-gated — and it must never
+    become a back door to the money, which is why it carries no value path at
+    all. The payee can confirm their own delivery but cannot write off."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    emitted = _capture_transfers(direct_vm, deliver=False)
+    _mid, bid = _resolved_yes_market(direct_vm, contract, bettor=direct_alice)
+
+    direct_vm.sender = direct_alice
+    assert int(contract.claim_winnings(bid)) == 985
+
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Only owner"):
+        contract.write_off_payout(bid)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Only owner"):
+        contract.write_off_payout(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    direct_vm.sender = direct_owner
+    assert contract.write_off_payout(bid) is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    assert _balance(direct_vm, direct_alice) == 0
+
+
+def test_owner_as_payee_gets_exactly_one_payout(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """The owner-bettor is the self-dealing case, and it is now moot by
+    construction: the owner cannot report for them, verify for them, or pay
+    them twice — only close the books. The platform fee and the entitlement
+    are separate emits, so count the entitlement alone."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    emitted = _capture_transfers(direct_vm, deliver=True)
+    _mid, bid = _resolved_yes_market(
+        direct_vm, contract, stake=1000, bettor=direct_owner,
+        counter=(direct_alice, 1000, "no"),
+    )
+
+    direct_vm.sender = direct_owner
+    assert int(contract.claim_winnings(bid)) == 1970
+    assert len(_emits_of(emitted, direct_owner, 1970)) == 1
+
+    # The owner can report as the payee; it pays nothing.
+    _past_settle_grace(direct_vm, "2025-01-02T01:00:01Z")
+    assert contract.report_failed_payout(bid) is True
+    assert len(_emits_of(emitted, direct_owner, 1970)) == 1
+
+    # And can write the entitlement off — which also issues no transfer.
+    assert contract.write_off_payout(bid) is True
+    assert len(_emits_of(emitted, direct_owner, 1970)) == 1
+
+    # The market outcome is untouched by any of it.
+    assert contract.get_market(_mid)["outcome"] == "yes"
+
+
+def test_void_refund_emitted_once_even_when_spent(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """Same at-most-once guarantee on the voided-market refund path, with the
+    payee spending the refund before reporting."""
     direct_vm.sender = direct_owner
     contract = direct_deploy("contracts/RealityBet.py")
     mid = _setup_open_market(direct_vm, contract)
     direct_vm.sender = direct_alice
-    direct_vm.value = 700
+    direct_vm.value = 1200
+    bid = contract.place_bet(mid, "yes")
+    direct_vm.value = 0
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+
+    emitted = _capture_transfers(direct_vm, deliver=True)
+    direct_vm.sender = direct_alice
+    assert contract.refund_void(bid) is True
+    assert _balance(direct_vm, direct_alice) == 1200
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Spent straight back out — the shape that used to unlock a second refund.
+    _set_balance(direct_vm, direct_alice, 7)
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
+    assert contract.report_failed_payout(bid) is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    assert contract.confirm_payout(bid) is True
+    assert contract.get_bet(bid)["payout_status"] == "delivered"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    with direct_vm.expect_revert("Already claimed"):
+        contract.refund_void(bid)
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+
+def test_funding_refund_emitted_once_even_when_spent(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """And on the funding-refund path: a delivered refund that the funder
+    spends down cannot be refunded a second time, at any balance."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 600
     contract.fund_market(mid)
     direct_vm.value = 0
     fids = contract.get_market_fundings(mid)
-    direct_vm.warp("2025-01-01T00:20:00Z")
-    contract.lock_market(mid)
-    direct_vm.warp(_RESOLVED_AT)
-    _mock_resolution(direct_vm, "void", "low")
-    contract.request_resolution(mid)
-    m = contract.get_market(mid)
-    assert m["status"] == "resolved" and m["outcome"] == "void"
-    _past_dispute_window(direct_vm)
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+
+    emitted = _capture_transfers(direct_vm, deliver=True)
     direct_vm.sender = direct_alice
-    assert int(contract.refund_funding(fids[0])) == 700
+    assert int(contract.refund_funding(fids[0])) == 600
+    assert _balance(direct_vm, direct_alice) == 600
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Funder spends it all, then receives unrelated value.
+    _set_balance(direct_vm, direct_alice, 0)
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
+    assert contract.report_failed_funding_refund(fids[0]) is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    direct_vm.sender = direct_owner
+    assert contract.write_off_funding_refund(fids[0]) is True
+    assert contract.get_funding(fids[0])["refund_status"] == "written_off"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # A second refund is refused outright, whatever the balance says.
+    _set_balance(direct_vm, direct_alice, 10 ** 30)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("Refund already requested"):
+        contract.refund_funding(fids[0])
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+    assert _balance(direct_vm, direct_alice) == 10 ** 30
+
+
+def test_failed_funding_refund_is_written_off_not_re_sent(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """A funding refund that genuinely fails is flagged and closed, never
+    re-sent — the deposit is recorded on-chain the whole time, so it is
+    never an anonymous, unrecoverable transfer."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    contract.fund_market(mid)
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+
+    emitted = _capture_transfers(direct_vm, deliver=False)
+    direct_vm.sender = direct_alice
+    assert int(contract.refund_funding(fids[0])) == 500
+    f = contract.get_funding(fids[0])
+    assert f["refunded"] is False and f["refund_status"] == "attempted"
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    _past_settle_grace(direct_vm, "2025-01-01T00:00:00Z")
+    assert contract.report_failed_funding_refund(fids[0]) is True
+    assert contract.get_funding(fids[0])["non_delivery_reported"] is True
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+    # Confirmation clears the report; the write-off closes without paying.
+    direct_vm.sender = direct_owner
+    assert contract.write_off_funding_refund(fids[0]) is True
+    assert contract.get_funding(fids[0])["refund_status"] == "written_off"
+    assert contract.get_funding(fids[0])["refunded"] is False
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+
+def test_funding_refund_report_is_funder_only(
+    direct_vm, direct_deploy, direct_owner, direct_alice, direct_bob
+):
+    """Nobody but the funder may flag a refund as undelivered, and nobody —
+    the owner included — can turn that flag into a payment."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 400
+    contract.fund_market(mid)
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+
+    emitted = _capture_transfers(direct_vm, deliver=False)
+    direct_vm.sender = direct_alice
+    contract.refund_funding(fids[0])
+
+    direct_vm.sender = direct_owner
+    with direct_vm.expect_revert("Only the funder can report non-delivery"):
+        contract.report_failed_funding_refund(fids[0])
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Only the funder can report non-delivery"):
+        contract.report_failed_funding_refund(fids[0])
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("Not authorized"):
+        contract.confirm_funding_refund(fids[0])
+    assert len(_payouts_to(emitted, direct_alice)) == 1
+
+
+def test_fund_market_records_entitlement_and_void_refunds(
+    direct_vm, direct_deploy, direct_owner, direct_alice
+):
+    """`fund_market` records a redeemable entitlement per deposit, so a
+    voided market returns the liquidity instead of locking it away — emitted
+    exactly once, and consumed only once delivery is confirmed."""
+    direct_vm.sender = direct_owner
+    contract = direct_deploy("contracts/RealityBet.py")
+    mid = _setup_open_market(direct_vm, contract)
+    direct_vm.sender = direct_alice
+    direct_vm.value = 500
+    assert contract.fund_market(mid) is True
+    direct_vm.value = 0
+    fids = contract.get_market_fundings(mid)
+    assert len(fids) == 1
+    f = contract.get_funding(fids[0])
+    assert f["amount"] == 500
+    assert f["funder"].lower() == _hex(direct_alice).lower()
+    assert f["refunded"] is False
+    odds = contract.get_odds(mid)
+    assert odds["pool_yes"] + odds["pool_no"] == 500
+    with direct_vm.expect_revert("Funding not refundable yet"):
+        contract.refund_funding(fids[0])
+    direct_vm.sender = direct_owner
+    contract.void_market(mid)
+    direct_vm.sender = direct_alice
+    assert int(contract.refund_funding(fids[0])) == 500
+    # Not consumed before delivery: `refunded` stays False until confirmed.
+    assert contract.get_funding(fids[0])["refunded"] is False
+    assert contract.get_funding(fids[0])["refund_status"] == "attempted"
+    with direct_vm.expect_revert("Refund already requested"):
+        contract.refund_funding(fids[0])
+    assert contract.confirm_funding_refund(fids[0]) is True
+    assert contract.get_funding(fids[0])["refunded"] is True
+    assert contract.get_funding(fids[0])["refund_status"] == "delivered"
+    with direct_vm.expect_revert("Already refunded"):
+        contract.refund_funding(fids[0])
 
 
 def test_refund_funding_rejects_non_funder(
